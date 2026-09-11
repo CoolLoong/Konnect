@@ -67,7 +67,7 @@ fn fixture_board(dir: &Path) -> PathBuf {
 ///
 /// One class with two exact-name patterns, one naming a live-only net and one
 /// naming a saved-only net, so `matched_nets` alone says which net list the
-/// answer was derived from.
+/// answer was derived from — and `unmatched_patterns` names the other one.
 fn write_project(board: &Path) {
     let pro = board.with_extension("kicad_pro");
     let settings = json!({
@@ -898,6 +898,7 @@ async fn netclasses_report_live_nets_beside_project_file_definitions() {
             "patterns": "project_file",
             "board_nets": "ipc",
             "matched_nets": "derived",
+            "unmatched_patterns": "derived",
         }),
         "{body}"
     );
@@ -918,6 +919,12 @@ async fn netclasses_report_live_nets_beside_project_file_definitions() {
     );
     assert_eq!(rails["matched_nets"], json!([LIVE_NETS[0]]), "{body}");
     assert_eq!(rails["clearance"], json!(0.5), "{body}");
+    // The pattern the live nets leave idle is the saved-only one.
+    assert_eq!(
+        body["unmatched_patterns"],
+        json!([{ "netclass": "Rails", "pattern": SAVED_NETS[0] }]),
+        "{body}"
+    );
 }
 
 /// The same call against the saved snapshot matches the other pattern, so the
@@ -945,10 +952,46 @@ async fn netclasses_saved_mode_matches_the_saved_nets_and_discloses_it() {
         "{body}"
     );
     assert_eq!(
+        body["unmatched_patterns"],
+        json!([{ "netclass": "Rails", "pattern": LIVE_NETS[0] }]),
+        "{body}"
+    );
+    assert_eq!(
+        body["sources"]["unmatched_patterns"],
+        json!("derived"),
+        "{body}"
+    );
+    assert_eq!(
         body["source_evidence"]["excludes_unsaved_editor_state"],
         json!(true),
         "{body}"
     );
+}
+
+/// A saved board that cannot be parsed leaves the nets unknown. The patterns
+/// still come from the project file, but which of them fit no net cannot be
+/// answered: the field is null and its source says so, rather than an empty
+/// list claiming every pattern matched.
+#[tokio::test]
+async fn netclasses_report_unmatched_patterns_as_unavailable_without_nets() {
+    let scene = Scene::offline().await;
+    std::fs::write(&scene.board, "(kicad_pcb (version 20260206").unwrap();
+
+    let body = scene.body("get_netclasses", Some("saved")).await;
+
+    assert!(body["unmatched_patterns"].is_null(), "{body}");
+    assert_eq!(
+        body["sources"],
+        json!({
+            "definitions": "project_file",
+            "patterns": "project_file",
+            "board_nets": "unavailable",
+            "matched_nets": "derived",
+            "unmatched_patterns": "unavailable",
+        }),
+        "{body}"
+    );
+    assert_eq!(body["nets_on_board"], json!(0), "{body}");
 }
 
 /// `get_netclasses` obeys the same live-identification rule as its sibling:
