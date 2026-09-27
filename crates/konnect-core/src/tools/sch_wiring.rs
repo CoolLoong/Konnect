@@ -2570,47 +2570,17 @@ async fn handle_connect_to_net(
         Some(d) => crate::tools::stub_direction(direction, Some(d)),
         None => crate::tools::resolve_stub_direction(direction, (pin_x, pin_y), &tree),
     };
-    let (label_x, label_y) = (pin_x + dir.dx * stub_length, pin_y + dir.dy * stub_length);
-    let label_rot = dir.label_rotation;
-
     let mut sch = cse::Schematic::load(&sch_path)?;
-
-    // T-junction detection for the wire stub
-    let mut existing_wires = cse_wires_to_sexp(&sch);
-    existing_wires.push(konnect_sexp::schematic::Wire {
-        x1: pin_x,
-        y1: pin_y,
-        x2: label_x,
-        y2: label_y,
-        uuid: None,
-    });
-    let junctions = find_t_junctions(&existing_wires, 0.01);
-
-    // Add wire stub
-    sch.add_wire(pin_x, pin_y, label_x, label_y);
-    add_missing_junctions(&mut sch, &junctions);
-    // Pins the stub passes over mid-segment also need junction dots.
     let pins = crate::tools::all_pin_endpoints(&tree);
-    add_missing_junctions(
+    let (label_x, label_y, label_rot) = add_net_stub(
         &mut sch,
-        &pins_mid_segment(&pins, pin_x, pin_y, label_x, label_y),
+        &pins,
+        (pin_x, pin_y),
+        &dir,
+        stub_length,
+        label_type,
+        &net,
     );
-
-    // set_rotation, not `at.rotation = …`: a bare rotation leaves `effects`
-    // unset, and KiCad then centres the text on the anchor (#43).
-    match label_type {
-        "global_label" => {
-            sch.add_global_label(&net, "input", label_x, label_y);
-            let idx = sch.global_labels.len() - 1;
-            if let Some(gl) = sch.global_labels.get_mut(idx) {
-                gl.set_rotation(label_rot);
-            }
-        }
-        _ => {
-            sch.add_label(&net, label_x, label_y)
-                .set_rotation(label_rot);
-        }
-    }
 
     sch.overwrite()?;
 
@@ -2620,6 +2590,73 @@ async fn handle_connect_to_net(
         "wire": { "x1": pin_x, "y1": pin_y, "x2": label_x, "y2": label_y },
         "label": { "x": label_x, "y": label_y, "rotation": label_rot }
     })))
+}
+
+/// Draw `connect_to_net`'s stub: a wire `stub_length` from `pin` along `dir`
+/// with the junctions it needs, and a net or global label at its end. Returns
+/// the label's position and rotation.
+pub(crate) fn add_net_stub(
+    sch: &mut cse::Schematic,
+    pins: &[(f64, f64)],
+    pin: (f64, f64),
+    dir: &crate::tools::StubDirection,
+    stub_length: f64,
+    label_type: &str,
+    net: &str,
+) -> (f64, f64, f64) {
+    let end = dir.end(pin, stub_length);
+    add_stub_wire(sch, pins, pin, end);
+    add_stub_label(sch, label_type, net, end, dir.label_rotation);
+    (end.0, end.1, dir.label_rotation)
+}
+
+/// The wire half of [`add_net_stub`]: the wire, plus junction dots where it
+/// makes a T or passes over a pin mid-segment.
+pub(crate) fn add_stub_wire(
+    sch: &mut cse::Schematic,
+    pins: &[(f64, f64)],
+    (x1, y1): (f64, f64),
+    (x2, y2): (f64, f64),
+) {
+    // T-junction detection for the wire stub
+    let mut existing_wires = cse_wires_to_sexp(sch);
+    existing_wires.push(konnect_sexp::schematic::Wire {
+        x1,
+        y1,
+        x2,
+        y2,
+        uuid: None,
+    });
+    let junctions = find_t_junctions(&existing_wires, 0.01);
+
+    sch.add_wire(x1, y1, x2, y2);
+    add_missing_junctions(sch, &junctions);
+    // Pins the stub passes over mid-segment also need junction dots.
+    add_missing_junctions(sch, &pins_mid_segment(pins, x1, y1, x2, y2));
+}
+
+/// The label half of [`add_net_stub`].
+pub(crate) fn add_stub_label(
+    sch: &mut cse::Schematic,
+    label_type: &str,
+    net: &str,
+    (x, y): (f64, f64),
+    rotation: f64,
+) {
+    // set_rotation, not `at.rotation = …`: a bare rotation leaves `effects`
+    // unset, and KiCad then centres the text on the anchor (#43).
+    match label_type {
+        "global_label" => {
+            sch.add_global_label(net, "input", x, y);
+            let idx = sch.global_labels.len() - 1;
+            if let Some(gl) = sch.global_labels.get_mut(idx) {
+                gl.set_rotation(rotation);
+            }
+        }
+        _ => {
+            sch.add_label(net, x, y).set_rotation(rotation);
+        }
+    }
 }
 
 async fn handle_connect_pins(
