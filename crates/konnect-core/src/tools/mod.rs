@@ -646,9 +646,10 @@ impl BoardEditorAbsence {
 /// rather than leaving it to ask again.
 ///
 /// Targeting is the whole point of this helper, and a closure that re-derives
-/// its own document pays a second `GetOpenDocuments` for the privilege — or,
-/// worse, reaches for a `KiCadIpcClient` method with no document argument,
-/// which addresses whichever board KiCad opened first.
+/// its own document pays a second `GetOpenDocuments` for the privilege. So
+/// does a `KiCadIpcClient` method with no document argument: it asks again,
+/// then reselects the bound board or fails with `StaleDocument` if that board
+/// has since closed.
 pub(crate) async fn with_bound_board_ipc_classified<T, F>(
     ctx: &ToolContext,
     board_path: &std::path::Path,

@@ -5180,22 +5180,38 @@ mod board_info_paper_tests {
 /// `with_board_ipc_classified` resolves the requested board before it runs
 /// its closure and hands the document over. A closure that calls
 /// `find_open_board` itself instead would pay a second `GetOpenDocuments`,
-/// each on its own socket, for a document it had already been given.
+/// each on its own socket, for a document it had already been given. The
+/// count alone does not show which document the closure then addresses, so
+/// the mock also records the document each board command names.
 #[cfg(test)]
 mod single_board_lookup_tests {
     use super::board_mock::ctx_talking_to;
     use super::*;
     use crate::test_support::MockIpcServer;
+    use kiapi::common::types::DocumentSpecifier;
     use konnect_ipc::gen::kiapi;
+    use prost::Message;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    /// Each board command the mock served, with the document it named.
+    type NamedDocuments = Arc<Mutex<Vec<(&'static str, Option<DocumentSpecifier>)>>>;
 
     /// A KiCad holding `board`, counting how many times it is asked which
-    /// documents are open.
-    fn spawn_kicad_counting_lookups(board: &Path, lookups: Arc<AtomicUsize>) -> MockIpcServer {
+    /// documents are open and recording the document every board command
+    /// names.
+    fn spawn_kicad_counting_lookups(
+        board: &Path,
+        lookups: Arc<AtomicUsize>,
+        named: NamedDocuments,
+    ) -> MockIpcServer {
         let document = super::board_mock::board_document(&board.to_string_lossy());
         MockIpcServer::spawn("counting-lookups", move |request| {
             let command = request.message.expect("a command");
+            let bytes = command.value.as_slice();
+            let name = |command: &'static str, document: Option<DocumentSpecifier>| {
+                named.lock().unwrap().push((command, document));
+            };
             let body = if command.type_url.ends_with("GetOpenDocuments") {
                 lookups.fetch_add(1, Ordering::Relaxed);
                 Some(konnect_ipc::builders::pack_any(
@@ -5205,6 +5221,8 @@ mod single_board_lookup_tests {
                     "kiapi.common.commands.GetOpenDocumentsResponse",
                 ))
             } else if command.type_url.ends_with("GetTitleBlockInfo") {
+                let request = kiapi::common::commands::GetTitleBlockInfo::decode(bytes).unwrap();
+                name("GetTitleBlockInfo", request.document);
                 Some(konnect_ipc::builders::pack_any(
                     &kiapi::common::types::TitleBlockInfo {
                         title: "Counted".to_string(),
@@ -5213,6 +5231,8 @@ mod single_board_lookup_tests {
                     "kiapi.common.types.TitleBlockInfo",
                 ))
             } else if command.type_url.ends_with("GetBoardEnabledLayers") {
+                let request = kiapi::board::commands::GetBoardEnabledLayers::decode(bytes).unwrap();
+                name("GetBoardEnabledLayers", request.board);
                 Some(konnect_ipc::builders::pack_any(
                     &kiapi::board::commands::BoardEnabledLayersResponse {
                         layers: vec![
@@ -5224,6 +5244,8 @@ mod single_board_lookup_tests {
                     "kiapi.board.commands.BoardEnabledLayersResponse",
                 ))
             } else if command.type_url.ends_with("GetNets") {
+                let request = kiapi::board::commands::GetNets::decode(bytes).unwrap();
+                name("GetNets", request.board);
                 Some(konnect_ipc::builders::pack_any(
                     &kiapi::board::commands::NetsResponse {
                         nets: vec![kiapi::board::types::Net {
@@ -5257,7 +5279,8 @@ mod single_board_lookup_tests {
         )
         .unwrap();
         let lookups = Arc::new(AtomicUsize::new(0));
-        let server = spawn_kicad_counting_lookups(&board, lookups.clone());
+        let named = NamedDocuments::default();
+        let server = spawn_kicad_counting_lookups(&board, lookups.clone(), named.clone());
         let ctx = ctx_talking_to(server.address().to_string());
 
         let result = handle_get_board_info(
@@ -5280,6 +5303,18 @@ mod single_board_lookup_tests {
             1,
             "the document the binding step resolved is handed to the closure, \
              so nothing asks KiCad for it a second time"
+        );
+        // One lookup is only right if the closure then addresses the document
+        // that lookup returned, not a blank or different one.
+        let resolved = super::board_mock::board_document(&board.to_string_lossy());
+        assert_eq!(
+            *named.lock().unwrap(),
+            [
+                ("GetTitleBlockInfo", Some(resolved.clone())),
+                ("GetBoardEnabledLayers", Some(resolved.clone())),
+                ("GetNets", Some(resolved)),
+            ],
+            "every board command names the document GetOpenDocuments returned"
         );
     }
 }
