@@ -265,6 +265,9 @@
     const svgEl = container.querySelector('svg');
     if (svgEl) {
       svgEl.style.background = 'transparent';
+      // kicad-cli's <title> ("SVG Image created as …") became a native
+      // tooltip over the whole sheet, and on Linux it left a gray ghost.
+      svgEl.querySelector(':scope > title')?.remove();
       // Ensure a viewBox so fitToPage can compute dimensions
       if (!svgEl.getAttribute('viewBox') && svgEl.getAttribute('width')) {
         const w = parseFloat(svgEl.getAttribute('width'));
