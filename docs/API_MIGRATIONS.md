@@ -3,6 +3,25 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: `route_pad_to_pad` reads its pads from the live board (patch release)
+
+`route_pad_to_pad` wrote its tracks to the board open in KiCad but read the two
+pad positions from the saved `.kicad_pcb`. After any unsaved move, including
+one made by `move_component`, the track ended where the pad had been and the
+call still reported `routed: true` (#700).
+
+Both pads are now read from the board open in KiCad, the same lookup
+`get_component_pads` makes first. The response adds `source: "ipc"`, and
+`from` / `to` carry the live coordinates the tracks were drawn between. The two
+segments of an L-bend are sent in one `CreateItems` rather than two. Arguments
+are unchanged.
+
+A footprint that is in the saved file but not on the live board is refused
+with `Footprint 'X' not found on the board open in KiCad`, and a missing pad
+with `Pad 'N' not found on 'X'`. Both are tool errors, and no track is written.
+Before, the first case routed to the saved position, and a pad missing from
+the file failed as an unclassified error rather than a tool result.
+
 ## Unreleased: an omitted reference keeps the library prefix (patch release)
 
 `add_schematic_component` and `batch_place_components` wrote a bare `?` when
