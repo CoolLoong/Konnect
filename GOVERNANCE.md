@@ -64,6 +64,17 @@ independent.
   `main` twice.
 - **CODEOWNERS is a routing hint, not a veto.** It auto-requests the right
   reviewer; it does not block a merge.
+- **A pending review request is not the review decision.** The ruleset requires
+  no approving-review count or code-owner approval. A maintainer records a
+  completed exact-head review as a GitHub comment review when reviewing someone
+  else's PR; the one `status:*` label still names the next actor. For their own
+  PR, where GitHub does not permit self-review, the maintainer records the
+  assessment in an ordinary PR comment. Neither record is merge permission.
+  After a completed review, a maintainer may clear a stale automatic CODEOWNERS
+  request only when that owner has no specific decision pending. Preserve
+  explicit review requests, requested changes, and owner decisions about scope,
+  releases, or licensing. See the
+  [review-request workflow](docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md#review-requests-and-completion).
 
 ### Review-to-merge execution
 

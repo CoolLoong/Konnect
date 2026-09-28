@@ -88,6 +88,8 @@ mark individual inapplicable rows with a reason. Do not invent runtime evidence.
 
 - [ ] The PR has exactly one current `status:*` workflow label.
 - [ ] `status:ready-to-merge` applies to this exact head SHA.
+- [ ] The completed review is recorded; only stale automatic CODEOWNERS requests
+  were cleared under the review-request workflow (manual requests remain open).
 - [ ] All required checks and review conversations satisfy the `main` ruleset.
 - [ ] Auto-merge uses a merge commit, or an already-green PR will be merged with `gh pr merge N --merge`.
 - [ ] Terminal issue closure and the next PR to promote are identified.
