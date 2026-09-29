@@ -15,9 +15,9 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{points_coincident, snap_point},
     schematic::{
-        extract_all_net_labels, extract_labels, extract_symbol_instances, extract_wires,
-        find_lib_symbol, format_net_label, format_wire, pin_endpoint, pin_outward_direction,
-        read_schematic, symbol_bounds_for_instance, SymbolBounds,
+        extract_all_net_labels, extract_buses, extract_labels, extract_symbol_instances,
+        extract_wires, find_lib_symbol, format_net_label, format_wire, pin_endpoint,
+        pin_outward_direction, read_schematic, symbol_bounds_for_instance, SymbolBounds,
     },
     writer::{apply_edits, new_uuid, read_consistent, write_atomic_if_unchanged, SexpEdit},
 };
@@ -1842,8 +1842,9 @@ async fn handle_validate_wire_connections(
 
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
+    let buses = extract_buses(&tree);
     let labels = extract_all_net_labels(&tree);
-    let index = ConnectivityIndex::build(&tree, &wires, &labels, tol);
+    let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, tol);
 
     let floating: Vec<serde_json::Value> = index
         .floating_wire_ends()
@@ -1874,8 +1875,9 @@ async fn handle_validate_component_connections(
     let ignore_power_pins = args["ignore_power_pins"].as_bool().unwrap_or(false);
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
+    let buses = extract_buses(&tree);
     let labels = extract_all_net_labels(&tree);
-    let index = ConnectivityIndex::build(&tree, &wires, &labels, COINCIDENT_TOLERANCE);
+    let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, COINCIDENT_TOLERANCE);
 
     let mut unconnected: Vec<serde_json::Value> = Vec::new();
 

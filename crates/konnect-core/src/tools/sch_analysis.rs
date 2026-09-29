@@ -14,9 +14,9 @@ use konnect_schematic_editor as cse;
 use konnect_sexp::{
     geometry::{point_on_segment, points_coincident},
     schematic::{
-        extract_all_net_labels, extract_labels, extract_sheet_pins, extract_symbol_instances,
-        extract_wires, find_lib_symbol, read_schematic, symbol_bounds_for_instance, Label,
-        LabelKind, LibPin, SymbolBounds, Wire,
+        extract_all_net_labels, extract_buses, extract_labels, extract_sheet_pins,
+        extract_symbol_instances, extract_wires, find_lib_symbol, read_schematic,
+        symbol_bounds_for_instance, Label, LabelKind, LibPin, SymbolBounds, Wire,
     },
 };
 use serde_json::json;
@@ -464,6 +464,7 @@ async fn handle_trace_from_point(
     };
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
+    let buses = extract_buses(&tree);
     let labels = extract_all_net_labels(&tree);
     let mut g = net_graph_for(&tree, &wires, &labels);
     let on_wire: Vec<_> = wires
@@ -486,7 +487,7 @@ async fn handle_trace_from_point(
     // second scan here is exactly how the connectivity tools drifted apart
     // before, and the index is also unit-aware, so a multi-unit symbol
     // contributes only the unit actually placed (#35).
-    let index = ConnectivityIndex::build(&tree, &wires, &labels, tol);
+    let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, tol);
     let detail = index.point_detail(x, y);
     let at_pin: Vec<_> = detail
         .pins
@@ -532,11 +533,12 @@ async fn handle_find_orphan_items(
 
     let (_, tree) = read_schematic(&sch_path)?;
     let wires = extract_wires(&tree);
+    let buses = extract_buses(&tree);
     // Every net name, so the index is the same one every other tool builds. A
     // power symbol's pseudo-label sits on the pin already indexed, so feeding
     // them changes no coincidence answer below.
     let labels = extract_all_net_labels(&tree);
-    let index = ConnectivityIndex::build(&tree, &wires, &labels, tolerance);
+    let index = ConnectivityIndex::build(&tree, &wires, &buses, &labels, tolerance);
 
     let mut all: Vec<serde_json::Value> = Vec::new();
 
@@ -560,7 +562,10 @@ async fn handle_find_orphan_items(
         .iter()
         .filter(|label| label.kind != LabelKind::PowerSymbol)
     {
-        if !index.on_wire(label.x, label.y) && !index.has_pin(label.x, label.y) {
+        if !index.on_wire(label.x, label.y)
+            && !index.on_bus(label.x, label.y)
+            && !index.has_pin(label.x, label.y)
+        {
             all.push(json!({
                 "type": "floating_label",
                 "net": label.net,
