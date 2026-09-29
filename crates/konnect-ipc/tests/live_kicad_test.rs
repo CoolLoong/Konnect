@@ -53,7 +53,10 @@
 //! hand before tagging a release.
 
 use konnect_ipc::client::KiCadIpcClient;
-use konnect_ipc::types::{IpcFlipOutcome, IpcFootprint3DModel};
+use konnect_ipc::types::{
+    IpcFlipOutcome, IpcFootprint3DModel, IpcFootprint3DModelEdit, IpcFootprint3DModelEditOutcome,
+    IpcVector3,
+};
 use konnect_sexp::{parse_sexp, SexpNode};
 use std::path::Path;
 
@@ -515,6 +518,142 @@ fn confirmed_flip(outcome: IpcFlipOutcome) -> (String, Vec<IpcFootprint3DModel>)
         } => (layer, models),
         other => panic!("expected a confirmed footprint flip, got {other:?}"),
     }
+}
+
+/// #305 live feasibility and acceptance: KiCad must accept a complete parent
+/// footprint carrying one changed nested Footprint3DModel, persist every
+/// supported model field, and leave the unrelated entries alone.
+#[test]
+#[ignore = "requires KiCad 10.0.6+ with a disposable board open and IPC enabled"]
+fn placed_footprint_model_entries_round_trip_through_live_kicad() {
+    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
+        .expect("KONNECT_LIVE_KICAD_BOARD must name the disposable open board");
+    let reference = std::env::var("KONNECT_LIVE_KICAD_REFERENCE").unwrap_or_else(|_| "P3".into());
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let client = KiCadIpcClient::new(socket);
+    let document = client
+        .find_open_board(Path::new(&board))
+        .expect("the disposable board is not open on this endpoint");
+    let original = client
+        .footprint_3d_model_snapshot_in(document.clone(), &reference)
+        .expect("initial model snapshot failed");
+
+    let added = IpcFootprint3DModel {
+        filename: "${KIPRJMOD}/konnect-305-spike.step".to_string(),
+        offset_mm: IpcVector3 {
+            x: 1.25,
+            y: -2.5,
+            z: 3.75,
+        },
+        rotation_degrees: IpcVector3 {
+            x: 10.0,
+            y: 20.0,
+            z: 30.0,
+        },
+        scale: IpcVector3 {
+            x: 0.5,
+            y: 1.5,
+            z: 2.0,
+        },
+        visible: false,
+        opacity: 0.42,
+    };
+    let appended = client
+        .edit_footprint_3d_models_in(
+            document.clone(),
+            &reference,
+            original.clone(),
+            IpcFootprint3DModelEdit::Append {
+                model: added.clone(),
+            },
+        )
+        .expect("append request failed");
+    let IpcFootprint3DModelEditOutcome::Applied {
+        after: appended_after,
+        changed,
+        ..
+    } = appended
+    else {
+        panic!("append outcome was uncertain: {appended:?}");
+    };
+    assert!(changed);
+    assert_eq!(
+        appended_after.models[..original.models.len()],
+        original.models
+    );
+    assert_eq!(appended_after.models.last(), Some(&added));
+    client.save_board().expect("save after append failed");
+    let saved_after_append = load_board(Path::new(&board));
+    assert_eq!(
+        footprint(&saved_after_append, &reference)
+            .find_all("model")
+            .len(),
+        original.models.len() + 1
+    );
+
+    let replacement = IpcFootprint3DModel {
+        filename: "${KIPRJMOD}/konnect-305-replacement.wrl".to_string(),
+        offset_mm: IpcVector3 {
+            x: -4.0,
+            y: 5.0,
+            z: -6.0,
+        },
+        rotation_degrees: IpcVector3 {
+            x: -15.0,
+            y: 45.0,
+            z: 90.0,
+        },
+        scale: IpcVector3 {
+            x: 2.0,
+            y: 2.5,
+            z: 3.0,
+        },
+        visible: true,
+        opacity: 0.73,
+    };
+    let replaced = client
+        .edit_footprint_3d_models_in(
+            document.clone(),
+            &reference,
+            appended_after,
+            IpcFootprint3DModelEdit::Replace {
+                index: original.models.len(),
+                model: replacement.clone(),
+            },
+        )
+        .expect("replace request failed");
+    let IpcFootprint3DModelEditOutcome::Applied {
+        after: replaced_after,
+        changed,
+        ..
+    } = replaced
+    else {
+        panic!("replace outcome was uncertain: {replaced:?}");
+    };
+    assert!(changed);
+    assert_eq!(
+        replaced_after.models[..original.models.len()],
+        original.models
+    );
+    assert_eq!(replaced_after.models.last(), Some(&replacement));
+    client.save_board().expect("save after replace failed");
+
+    let removed = client
+        .edit_footprint_3d_models_in(
+            document,
+            &reference,
+            replaced_after,
+            IpcFootprint3DModelEdit::Remove {
+                index: original.models.len(),
+            },
+        )
+        .expect("remove request failed");
+    let IpcFootprint3DModelEditOutcome::Applied { after, changed, .. } = removed else {
+        panic!("remove outcome was uncertain: {removed:?}");
+    };
+    assert!(changed);
+    assert_eq!(after.models, original.models);
+    client.save_board().expect("final restoring save failed");
 }
 
 /// #604 live acceptance: KiCad itself must perform the F.Cu -> B.Cu -> F.Cu

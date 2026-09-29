@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **226 registered tools** + **7 always-visible meta-tools** = **233 total**
+- **227 registered tools** + **7 always-visible meta-tools** = **234 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -251,8 +251,8 @@ and Windows servers do not.
 | `add_zone` | Add a copper fill zone polygon on a specified layer and net, with optional `name`, `priority` and `pad_connection` (`solid`/`thermal`/`none`). Tries KiCad IPC first — a live board gets the zone through the API and a refill, so it appears immediately and is undoable — and falls back to an S-expression file insert only when no live KiCad answers, reporting `source` and a `warning` when it does. Refuses a net the board does not declare rather than binding copper to net 0, and refuses outright if KiCad answers but rejects the request. |
 | `import_svg_logo` | Import an SVG file as filled silkscreen/copper artwork (curves flattened to polygons). |
 
-### `pcb_components` · 19 tools
-**Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics.
+### `pcb_components` · 20 tools
+**Purpose:** Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics and 3D models.
 **Source:** [`crates/konnect-core/src/tools/pcb_components.rs`](crates/konnect-core/src/tools/pcb_components.rs)
 
 | Tool | Description |
@@ -269,6 +269,7 @@ and Windows servers do not.
 | `update_footprints_from_library` | Plan or atomically apply KiCad's Update Footprints from Library operation to placed footprints on the live board. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placed-instance state and pad nets while refreshing supported library-owned content. |
 | `list_board_footprint_graphics` | List the graphic items inside a footprint placed on the board — silkscreen, fabrication, and courtyard artwork — with the UUID needed to edit one. Reports `editable`, plus `outlines` and `holes` for polygons. Requires KiCAD running with the board open. |
 | `edit_board_footprint_graphic` | Replace the vertices of a single-outline polygon inside a placed footprint, selected by UUID, without re-placing the part. Anything with multiple outlines or holes is refused by name rather than flattened. Requires KiCAD running with the board open. |
+| `set_placed_footprint_models` | Inspect, append, replace, or remove one exact indexed 3D-model entry on a placed footprint through live KiCad IPC. Mutations require the latest inspection revision, update the complete parent footprint in one undo step, preserve unrelated entries, and return fresh readback. There is no open-board file fallback. |
 | `get_component_pads` | Return live board-space pad positions, layers, and net assignments when KiCAD IPC is reachable; fall back to the saved board only when IPC is unreachable. A pad whose saved net node is present but unreadable reports `null` rather than an empty string. |
 | `get_pad_position` | Return the live board-space position, layers, and net assignment of a specific pad number. |
 | `get_component_list` | List all footprints on the board with positions, layers, and values. |

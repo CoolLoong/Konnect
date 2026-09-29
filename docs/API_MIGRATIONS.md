@@ -3,6 +3,21 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: placed-footprint 3D-model editing (minor release)
+
+The `pcb_components` toolset adds `set_placed_footprint_models`. It can inspect
+the ordered 3D-model entries on one exact placed footprint, then append,
+replace, or remove one zero-based entry. Every mutation requires the exact
+`models_revision` returned by a current inspection and updates the complete
+parent footprint through live KiCad IPC in one undo step.
+
+Each model carries its path, offset, rotation, scale, visibility, and opacity.
+Success is derived from a fresh readback; a changed precondition is refused as
+`stale_target`, and an unconfirmed post-mutation state is reported as
+`mutation_outcome_uncertain`. The tool requires the requested board to be open
+in KiCad and never rewrites the board file behind the editor. This is an
+additive tool and response surface planned for the next minor release.
+
 ## Unreleased: `route_pad_to_pad` reads its pads from the live board (patch release)
 
 `route_pad_to_pad` wrote its tracks to the board open in KiCad but read the two
