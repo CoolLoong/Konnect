@@ -1356,32 +1356,18 @@ pub(crate) fn reconcile_junctions_at(
         return (content, 0, 0);
     };
     let wires = extract_wires(&tree);
+    let buses = konnect_sexp::schematic::extract_buses(&tree);
     let labels = konnect_sexp::schematic::extract_all_net_labels(&tree);
     let idx = crate::tools::sch_connectivity::ConnectivityIndex::build(
         &tree,
         &wires,
+        &buses,
         &labels,
         crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
     );
-    // The shared index does not model buses yet, and KiCAD has bus junctions:
-    // a dot on a bus tee joins bus segments, which no wire count can see. Any
-    // candidate point touching a bus line is therefore outside this pass's
-    // jurisdiction — neither pruned nor added at. This is a guard, not a fifth
-    // attachment answer: the moment the index learns buses, it replaces this.
-    let buses = konnect_sexp::schematic::extract_buses(&tree);
-    let on_bus = |x: f64, y: f64| {
-        buses.iter().any(|b| {
-            konnect_sexp::geometry::point_on_segment(
-                x,
-                y,
-                b.x1,
-                b.y1,
-                b.x2,
-                b.y2,
-                crate::tools::sch_connectivity::COINCIDENT_TOLERANCE,
-            )
-        })
-    };
+    // A bus junction remains outside ordinary wire-junction mutation. The
+    // shared index owns this geometric answer so validators and mutation do
+    // not drift apart again (#328).
     let pins_known = !idx.placed_pins().is_empty() || extract_symbol_instances(&tree).is_empty();
 
     // Existing dots at the candidate points, with the byte range to delete —
@@ -1412,7 +1398,7 @@ pub(crate) fn reconcile_junctions_at(
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut to_add: Vec<(f64, f64)> = Vec::new();
     for &(px, py) in points {
-        if on_bus(px, py) {
+        if idx.on_bus(px, py) {
             continue;
         }
         let here: Vec<&Dot> = existing

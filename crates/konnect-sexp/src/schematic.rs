@@ -78,6 +78,52 @@ pub fn extract_buses(tree: &SexpNode) -> Vec<Wire> {
     extract_schematic_lines(tree, "bus")
 }
 
+/// The two authored vectors that define one schematic bus entry.
+///
+/// KiCad stores one corner in `(at x y)` and the diagonal to the other in
+/// `(size dx dy)`. Both are optional here on purpose: analyzers must retain a
+/// malformed entry as malformed evidence rather than drop it and later invent
+/// a direction from a calling convention.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BusEntry {
+    pub at: Option<(f64, f64)>,
+    pub size: Option<(f64, f64)>,
+    pub uuid: Option<String>,
+}
+
+impl BusEntry {
+    /// The authored `(at)` corner and its `(at + size)` corner, when both
+    /// vectors are finite. Absence means the saved geometry cannot establish
+    /// connectivity and callers must fail conservatively.
+    pub fn endpoints(&self) -> Option<((f64, f64), (f64, f64))> {
+        let ((x, y), (dx, dy)) = (self.at?, self.size?);
+        if ![x, y, dx, dy].into_iter().all(f64::is_finite) {
+            return None;
+        }
+        Some(((x, y), (x + dx, y + dy)))
+    }
+}
+
+/// Extract every top-level bus entry, including malformed entries whose
+/// `(at)` or `(size)` vector cannot be decoded. Keeping those records and their
+/// UUIDs lets higher layers abstain or diagnose without guessing a wire side.
+pub fn extract_bus_entries(tree: &SexpNode) -> Vec<BusEntry> {
+    tree.find_all("bus_entry")
+        .into_iter()
+        .map(|node| {
+            let pair = |tag: &str| {
+                let child = node.find(tag)?;
+                Some((child.get_f64(1)?, child.get_f64(2)?))
+            };
+            BusEntry {
+                at: pair("at"),
+                size: pair("size"),
+                uuid: node.find_str("uuid").map(String::from),
+            }
+        })
+        .collect()
+}
+
 fn extract_schematic_lines(tree: &SexpNode, kind: &str) -> Vec<Wire> {
     tree.find_all(kind)
         .iter()
@@ -1412,6 +1458,35 @@ mod label_tag_tests {
         assert_eq!(size.get_f64(1), Some(-2.54));
         assert_eq!(size.get_f64(2), Some(-2.54));
         assert!(entry.find("uuid").is_some());
+    }
+
+    #[test]
+    fn bus_entry_extractor_preserves_geometry_uuid_and_malformed_records() {
+        let tree = parse_sexp(
+            r#"(kicad_sch
+                (bus_entry (at 10.16 20.32) (size 2.54 -2.54) (uuid "complete"))
+                (bus_entry (at 30.48 40.64) (uuid "missing-size"))
+                (bus_entry (at nope 50.8) (size 2.54 2.54) (uuid "bad-at"))
+                (bus_entry (at NaN 60.96) (size 2.54 2.54) (uuid "non-finite"))
+            )"#,
+        )
+        .unwrap();
+
+        let entries = extract_bus_entries(&tree);
+        assert_eq!(entries.len(), 4, "malformed entries must not disappear");
+        assert_eq!(entries[0].at, Some((10.16, 20.32)));
+        assert_eq!(entries[0].size, Some((2.54, -2.54)));
+        assert_eq!(entries[0].uuid.as_deref(), Some("complete"));
+        assert_eq!(
+            entries[0].endpoints(),
+            Some(((10.16, 20.32), (12.7, 17.78)))
+        );
+        assert_eq!(entries[1].uuid.as_deref(), Some("missing-size"));
+        assert_eq!(entries[1].endpoints(), None);
+        assert_eq!(entries[2].uuid.as_deref(), Some("bad-at"));
+        assert_eq!(entries[2].endpoints(), None);
+        assert_eq!(entries[3].uuid.as_deref(), Some("non-finite"));
+        assert_eq!(entries[3].endpoints(), None);
     }
 
     #[test]
