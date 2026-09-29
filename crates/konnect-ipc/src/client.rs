@@ -2112,8 +2112,17 @@ impl KiCadIpcClient {
 
     /// Resolve a net name to its net code by querying GetNets.
     pub fn resolve_net_code(&self, net_name: &str) -> Result<i32> {
-        let nets = self.get_nets()?;
-        nets.iter()
+        self.resolve_net_code_in(self.get_board_document()?, net_name)
+    }
+
+    /// As [`Self::resolve_net_code`], targeting a specific open document.
+    pub fn resolve_net_code_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        net_name: &str,
+    ) -> Result<i32> {
+        self.get_nets_in(document)?
+            .iter()
             .find(|n| n.name == net_name)
             .map(|n| n.netcode)
             .ok_or_else(|| anyhow::anyhow!("Net '{}' not found on board", net_name))
@@ -2331,11 +2340,35 @@ impl KiCadIpcClient {
         x2: f64,
         y2: f64,
     ) -> Result<()> {
-        let net_code = self.resolve_net_code(net_name)?;
-        let track = crate::builders::build_track(net_name, net_code, layer, width, x1, y1, x2, y2);
-        let any = crate::builders::pack_any(&track, "kiapi.board.types.Track");
-        self.create_items(vec![any])?;
-        Ok(())
+        self.add_tracks_in(
+            self.get_board_document()?,
+            net_name,
+            layer,
+            width,
+            &[(x1, y1, x2, y2)],
+        )
+    }
+
+    /// Add track segments `(x1, y1, x2, y2)` of one net to a specific open
+    /// document, in a single `CreateItems`.
+    pub fn add_tracks_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        net_name: &str,
+        layer: &str,
+        width: f64,
+        segments: &[(f64, f64, f64, f64)],
+    ) -> Result<()> {
+        let net_code = self.resolve_net_code_in(document.clone(), net_name)?;
+        let items = segments
+            .iter()
+            .map(|&(x1, y1, x2, y2)| {
+                let track =
+                    crate::builders::build_track(net_name, net_code, layer, width, x1, y1, x2, y2);
+                crate::builders::pack_any(&track, "kiapi.board.types.Track")
+            })
+            .collect();
+        self.create_items_in(document, items)
     }
 
     /// Add a through via (F.Cu → B.Cu) to the board.
