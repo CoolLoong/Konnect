@@ -690,6 +690,27 @@ pub enum BoardTargetError {
     },
 }
 
+/// A reference designator did not identify one exact placed footprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FootprintTargetError {
+    Missing { reference: String },
+    Ambiguous { reference: String, matches: usize },
+}
+
+impl std::fmt::Display for FootprintTargetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing { reference } => write!(formatter, "Footprint '{reference}' not found"),
+            Self::Ambiguous { reference, matches } => write!(
+                formatter,
+                "Footprint reference '{reference}' is ambiguous: KiCad returned {matches} matches"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FootprintTargetError {}
+
 impl BoardTargetError {
     pub fn proves_not_open(&self) -> bool {
         matches!(
@@ -2805,9 +2826,217 @@ impl KiCadIpcClient {
                     rotation_degrees: vector(model.rotation, "rotation_degrees")?,
                     scale: vector(model.scale, "scale")?,
                     visible: model.visible,
+                    opacity: model.opacity,
                 })
             })
             .collect()
+    }
+
+    fn footprint_3d_model_message(
+        model: &crate::types::IpcFootprint3DModel,
+    ) -> kiapi::board::types::Footprint3DModel {
+        let vector = |value: crate::types::IpcVector3| kiapi::common::types::Vector3D {
+            x_nm: value.x,
+            y_nm: value.y,
+            z_nm: value.z,
+        };
+        kiapi::board::types::Footprint3DModel {
+            filename: model.filename.clone(),
+            scale: Some(vector(model.scale)),
+            rotation: Some(vector(model.rotation_degrees)),
+            offset: Some(vector(model.offset_mm)),
+            visible: model.visible,
+            opacity: model.opacity,
+        }
+    }
+
+    fn find_footprint_instance_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+    ) -> Result<kiapi::board::types::FootprintInstance> {
+        let mut matches = self
+            .get_items_in(
+                document,
+                kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+            )?
+            .into_iter()
+            .filter_map(|item| {
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).ok()
+            })
+            .filter(|footprint| {
+                footprint
+                    .reference_field
+                    .as_ref()
+                    .and_then(|field| field.text.as_ref())
+                    .and_then(|text| text.text.as_ref())
+                    .map(|text| text.text.as_str())
+                    == Some(reference)
+            })
+            .collect::<Vec<_>>();
+        match matches.len() {
+            0 => Err(FootprintTargetError::Missing {
+                reference: reference.to_string(),
+            }
+            .into()),
+            1 => Ok(matches.remove(0)),
+            matches => Err(FootprintTargetError::Ambiguous {
+                reference: reference.to_string(),
+                matches,
+            }
+            .into()),
+        }
+    }
+
+    /// Read one exact placed footprint's ordered 3D-model list from live KiCad.
+    pub fn footprint_3d_model_snapshot_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+    ) -> Result<crate::types::IpcFootprint3DModelSnapshot> {
+        let footprint = self.find_footprint_instance_in(document, reference)?;
+        let kiid = footprint
+            .id
+            .as_ref()
+            .map(|id| id.value.clone())
+            .filter(|value| !value.is_empty())
+            .with_context(|| format!("footprint '{reference}' has no KIID"))?;
+        Ok(crate::types::IpcFootprint3DModelSnapshot {
+            reference: reference.to_string(),
+            kiid,
+            models: Self::footprint_3d_models(&footprint)?,
+        })
+    }
+
+    /// Edit one exact ordered 3D-model entry by updating the complete parent
+    /// footprint in one KiCad undo transaction, then prove the result through
+    /// a fresh readback. This method never saves the board.
+    pub fn edit_footprint_3d_models_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        reference: &str,
+        expected_before: crate::types::IpcFootprint3DModelSnapshot,
+        edit: crate::types::IpcFootprint3DModelEdit,
+    ) -> Result<crate::types::IpcFootprint3DModelEditOutcome> {
+        use crate::types::IpcFootprint3DModelEdit::{Append, Remove, Replace};
+        use crate::types::IpcFootprint3DModelEditOutcome::{Applied, Conflict, Uncertain};
+
+        let mut footprint = self.find_footprint_instance_in(document.clone(), reference)?;
+        let before = crate::types::IpcFootprint3DModelSnapshot {
+            reference: reference.to_string(),
+            kiid: footprint
+                .id
+                .as_ref()
+                .map(|id| id.value.clone())
+                .filter(|value| !value.is_empty())
+                .with_context(|| format!("footprint '{reference}' has no KIID"))?,
+            models: Self::footprint_3d_models(&footprint)?,
+        };
+        if before != expected_before {
+            return Ok(Conflict {
+                expected: expected_before,
+                observed: before,
+            });
+        }
+        let definition = footprint
+            .definition
+            .as_mut()
+            .with_context(|| format!("footprint '{reference}' carries no definition"))?;
+        let model_positions = definition
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(position, item)| {
+                crate::builders::any_is(item, "kiapi.board.types.Footprint3DModel")
+                    .then_some(position)
+            })
+            .collect::<Vec<_>>();
+
+        match &edit {
+            Append { model } => {
+                let insert_at = model_positions
+                    .last()
+                    .map(|position| position + 1)
+                    .unwrap_or(definition.items.len());
+                definition.items.insert(
+                    insert_at,
+                    crate::builders::pack_any(
+                        &Self::footprint_3d_model_message(model),
+                        "kiapi.board.types.Footprint3DModel",
+                    ),
+                );
+            }
+            Replace { index, model } => {
+                let position = *model_positions.get(*index).with_context(|| {
+                    format!(
+                        "3D-model index {index} is out of range for {} entries",
+                        model_positions.len()
+                    )
+                })?;
+                definition.items[position] = crate::builders::pack_any(
+                    &Self::footprint_3d_model_message(model),
+                    "kiapi.board.types.Footprint3DModel",
+                );
+            }
+            Remove { index } => {
+                let position = *model_positions.get(*index).with_context(|| {
+                    format!(
+                        "3D-model index {index} is out of range for {} entries",
+                        model_positions.len()
+                    )
+                })?;
+                definition.items.remove(position);
+            }
+        }
+
+        let expected_models = Self::footprint_3d_models(&footprint)?;
+        if expected_models == before.models {
+            return Ok(Applied {
+                before: before.clone(),
+                after: before,
+                changed: false,
+            });
+        }
+
+        let packed = crate::builders::pack_any(&footprint, "kiapi.board.types.FootprintInstance");
+        let mutation = self.run_commit("Edit placed footprint 3D models", |client| {
+            client.update_items_in(document.clone(), vec![packed])
+        });
+        let readback = self.footprint_3d_model_snapshot_in(document, reference);
+
+        match (mutation, readback) {
+            (Ok(()), Ok(after)) if after.kiid == before.kiid && after.models == expected_models => {
+                Ok(Applied {
+                    before,
+                    after,
+                    changed: true,
+                })
+            }
+            (Err(_), Ok(after))
+                if after.kiid == before.kiid && after.models == expected_models =>
+            {
+                Ok(Applied {
+                    before,
+                    after,
+                    changed: true,
+                })
+            }
+            (Err(error), Ok(after)) if after.kiid == before.kiid && after.models == before.models => {
+                Err(error).context("KiCad rejected the 3D-model edit; fresh readback confirmed the footprint is unchanged")
+            }
+            (mutation, readback) => Ok(Uncertain {
+                reference: reference.to_string(),
+                kiid: before.kiid,
+                expected_models,
+                observed_models: readback.ok().map(|snapshot| snapshot.models),
+                reason: match mutation {
+                    Ok(()) => "KiCad accepted the parent-footprint update, but fresh readback did not confirm the requested 3D-model list".to_string(),
+                    Err(error) => format!(
+                        "the parent-footprint update returned an error and fresh readback did not prove either the old or requested 3D-model list: {error:#}"
+                    ),
+                },
+            }),
+        }
     }
 
     /// Flip a placed footprint to `target_layer` ("F.Cu" or "B.Cu") using

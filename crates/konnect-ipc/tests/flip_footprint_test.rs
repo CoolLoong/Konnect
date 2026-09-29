@@ -559,6 +559,7 @@ fn flip_success_reports_layer_and_flipped_3d_model_and_leaves_the_pad_alone() {
                 z: 1.0
             },
             visible: true,
+            opacity: original_models[0].opacity,
         }
     );
 
@@ -797,6 +798,7 @@ fn starting_models_as_ipc(
                 z: model.scale.as_ref().unwrap().z_nm,
             },
             visible: model.visible,
+            opacity: model.opacity,
         })
         .collect()
 }

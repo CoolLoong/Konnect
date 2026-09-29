@@ -1829,7 +1829,7 @@ fn indent_block(block: &str, indent: &str, eol: &str) -> String {
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 pub fn tools() -> Vec<ToolDef> {
-    vec![
+    let mut tools = vec![
         tool!(
             "place_component",
             "Place a footprint on the PCB. Uses live KiCAD IPC when reachable; otherwise safely \
@@ -2169,7 +2169,9 @@ pub fn tools() -> Vec<ToolDef> {
             }),
             |args, ctx| async move { handle_get_board_2d_view(args, ctx).await }
         ),
-    ]
+    ];
+    tools.push(super::placed_footprint_models::tool());
+    tools
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────

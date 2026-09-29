@@ -588,6 +588,51 @@ pub struct IpcFootprint3DModel {
     /// Unitless model scale along each axis.
     pub scale: IpcVector3,
     pub visible: bool,
+    pub opacity: f64,
+}
+
+/// One exact live footprint and the ordered 3D-model entries KiCad returned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcFootprint3DModelSnapshot {
+    pub reference: String,
+    pub kiid: String,
+    pub models: Vec<IpcFootprint3DModel>,
+}
+
+/// A bounded edit to the ordered 3D-model entries on one placed footprint.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcFootprint3DModelEdit {
+    Append {
+        model: IpcFootprint3DModel,
+    },
+    Replace {
+        index: usize,
+        model: IpcFootprint3DModel,
+    },
+    Remove {
+        index: usize,
+    },
+}
+
+/// Readback-derived result of editing a placed footprint's 3D-model entries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum IpcFootprint3DModelEditOutcome {
+    Conflict {
+        expected: IpcFootprint3DModelSnapshot,
+        observed: IpcFootprint3DModelSnapshot,
+    },
+    Applied {
+        before: IpcFootprint3DModelSnapshot,
+        after: IpcFootprint3DModelSnapshot,
+        changed: bool,
+    },
+    Uncertain {
+        reference: String,
+        kiid: String,
+        expected_models: Vec<IpcFootprint3DModel>,
+        observed_models: Option<Vec<IpcFootprint3DModel>>,
+        reason: String,
+    },
 }
 
 /// The result of a `flip_footprint` call against a live KiCad IPC session.
