@@ -182,7 +182,7 @@ and Windows servers do not.
 | `batch_connect_to_net` | Connect many pins to a named net by adding labels at each endpoint, oriented away from the symbol body. `stub_length`, `direction` and `label_type` give `connect_to_net`'s stub and label for every pin in the call. Single read → all edits → single write. |
 | `batch_delete` | Delete multiple schematic items (wires, labels, junctions, components) by UUID or reference — single file write. |
 | `bulk_move_schematic_components` | Move multiple components by a uniform dx/dy offset in a single atomic write. Junction dots are re-judged, and a no-connect flag travels with the pin it protects. |
-| `batch_edit_schematic_components` | Apply field updates (Value, Footprint, custom properties) to multiple components in a single atomic write. |
+| `batch_edit_schematic_components` | Update fields on multiple schematic components in one atomic write. Set `create_missing: true` to create missing custom fields on every placed unit; built-in fields remain update-only. Per-field `updated_units` and `created_units` report what happened. |
 | `batch_delete_schematic_components` | Delete multiple components by reference designator in a single atomic write. |
 | `connect_passthrough` | Add a wire stub and matching net label at a point to route a signal through a region without drawing a full path. Direction defaults to `auto`. |
 | `add_schematic_text` | Add a text annotation (non-net label) to the schematic at a given position. Aligns the text against that position with `justify`, per axis and defaulting to `left bottom` as KiCad does; an omitted axis is centred, and `center` centres both. Takes `bold`, `italic`, `thickness` and `color` for the font. |

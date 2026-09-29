@@ -3,6 +3,24 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: opt-in custom fields in `batch_edit_schematic_components` (minor release)
+
+`batch_edit_schematic_components` adds an optional `create_missing` boolean,
+defaulting to `false`. Existing calls remain update-only. When it is `true`, a
+missing custom field from an edit's `fields` object is created on every placed
+unit of that component; a field already present on some units is updated there
+and created on the remaining units in the same atomic file write.
+
+Built-in properties remain update-only, and `Reference` cannot be routed
+through `fields`. Custom field values must be strings. Duplicate assignments to
+the same component and field are skipped after the first and reported in
+`errors`, preserving the tool's existing partial-batch response contract.
+
+Each successful field result adds `updated_units` and `created_units`; each
+component result adds `updated_fields` and `created_fields`; the top-level
+response adds `updated_unit_copies` and `created_unit_copies`. The existing
+`updated_count`, `updated`, and `errors` fields keep their meanings.
+
 ## Unreleased: placed-footprint 3D-model editing (minor release)
 
 The `pcb_components` toolset adds `set_placed_footprint_models`. It can inspect

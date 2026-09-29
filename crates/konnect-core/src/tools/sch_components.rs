@@ -2429,9 +2429,9 @@ fn is_reserved_property(name: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PropertyWriteCounts {
-    updated: usize,
-    added: usize,
+pub(crate) struct PropertyWriteCounts {
+    pub(crate) updated: usize,
+    pub(crate) added: usize,
 }
 
 fn escape_property_text(value: &str) -> String {
@@ -2498,10 +2498,21 @@ fn property_insert_edit(
 
     let escaped_name = escape_property_text(name);
     let escaped_value = escape_property_text(value);
+    let newline = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let prop = format!(
-        "\n{indent}(property \"{escaped_name}\" \"{escaped_value}\"\n{indent}\t(at {x} {y} 0)\n\
-         {indent}\t(hide yes)\n{indent}\t(effects\n{indent}\t\t(font\n{indent}\t\t\t\
-         (size 1.27 1.27)\n{indent}\t\t)\n{indent}\t)\n{indent})"
+        "{newline}{indent}(property \"{escaped_name}\" \"{escaped_value}\"{newline}\
+         {indent}\t(at {x} {y} 0){newline}\
+         {indent}\t(hide yes){newline}\
+         {indent}\t(effects{newline}\
+         {indent}\t\t(font{newline}\
+         {indent}\t\t\t(size 1.27 1.27){newline}\
+         {indent}\t\t){newline}\
+         {indent}\t){newline}\
+         {indent})"
     );
 
     // Insert before the block's closing paren so the property stays inside it.
@@ -2518,7 +2529,7 @@ fn property_insert_edit(
 /// Custom fields may be present on only some units in a legacy/broken sheet;
 /// `add_missing=true` updates those copies and fills the missing ones in the
 /// same atomic document command.
-fn set_property_value(
+pub(crate) fn set_property_value(
     content: &str,
     reference: &str,
     field: &str,

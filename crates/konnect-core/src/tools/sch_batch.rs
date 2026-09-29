@@ -1,9 +1,9 @@
 //! `sch_batch` toolset — bulk/batch operations on schematic elements.
 //!
 //! **Critical invariant**: every write handler performs a single file read,
-//! collects ALL mutations as `SexpEdit` values against the original content,
-//! then calls `write_atomic` exactly once. This fixes the Python bug where
-//! `batch_connect_to_net` did N separate read/write cycles.
+//! plans or applies all mutations in memory, then commits exactly once. This
+//! fixes the Python bug where `batch_connect_to_net` did N separate read/write
+//! cycles.
 
 use crate::mcp::protocol::CallToolResult;
 use crate::tool;
@@ -29,7 +29,7 @@ use super::sch_connectivity::{ConnectivityIndex, COINCIDENT_TOLERANCE};
 use super::sch_annotate::opt_string;
 use super::sch_components::{
     commit_component_deletion, indexed_uuid_items, place_one_component, placed_component_readback,
-    plan_component_and_item_deletions, ComponentDeleteTargetError,
+    plan_component_and_item_deletions, set_property_value, ComponentDeleteTargetError,
 };
 use super::sch_wiring::{
     add_stub_label, add_stub_wire, resolve_pin_endpoint, resolve_placed_pin, route_between,
@@ -200,11 +200,17 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "batch_edit_schematic_components",
             "Apply field updates (Value, Footprint, custom properties) to multiple components \
-             in a single atomic file write.",
+             in a single atomic file write. Missing custom properties are created on every \
+             placed unit only when create_missing is true.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Path to .kicad_sch file" },
+                    "create_missing": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Create missing custom properties on every placed unit. Built-in properties remain update-only."
+                    },
                     "edits": {
                         "type": "array",
                         "description": "List of {reference, value?, footprint?, fields?} edit objects",
@@ -216,7 +222,7 @@ pub fn tools() -> Vec<ToolDef> {
                                 "footprint": { "type": "string" },
                                 "fields": {
                                     "type": "object",
-                                    "additionalProperties": true,
+                                    "additionalProperties": { "type": "string" },
                                     "description": "Additional property fields as key:value pairs"
                                 }
                             },
@@ -1147,11 +1153,19 @@ async fn handle_batch_edit(
         None => return Ok(CallToolResult::error("Missing 'edits' array")),
     };
 
-    let content = read_consistent(&sch_path)?;
-    let expected = content.clone();
-    let mut file_edits: Vec<SexpEdit> = Vec::new();
+    let create_missing = match args.get("create_missing") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(value)) => *value,
+        Some(_) => return Ok(invalid_arg("create_missing", "must be a boolean")),
+    };
+
+    let expected = read_consistent(&sch_path)?;
+    let mut content = expected.clone();
     let mut changed: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut seen_assignments = HashSet::new();
+    let mut updated_unit_copies = 0;
+    let mut created_unit_copies = 0;
 
     for edit_spec in &edits_arr {
         let reference = match edit_spec["reference"].as_str() {
@@ -1163,51 +1177,112 @@ async fn handle_batch_edit(
         };
 
         let mut component_changes: Vec<String> = Vec::new();
+        let mut field_results = Vec::new();
+        let mut updated_fields = BTreeSet::new();
+        let mut created_fields = BTreeSet::new();
 
         // Standard fields, then arbitrary extra fields from the "fields" object.
         // Each is rewritten in every unit's block, which is where a multi-unit
         // part keeps its copies of the value.
-        let extra = edit_spec["fields"].as_object();
-        let specs = [("Value", "value"), ("Footprint", "footprint")]
-            .into_iter()
-            .filter_map(|(field, key)| Some((field.to_string(), edit_spec[key].as_str()?)))
-            .chain(
-                extra
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|(name, val)| Some((name.clone(), val.as_str()?))),
-            );
+        let extra = match edit_spec.get("fields") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(fields)) => Some(fields),
+            Some(_) => {
+                errors.push(format!("'fields' for '{reference}' must be an object"));
+                None
+            }
+        };
+        let mut specs: Vec<(String, String, bool)> =
+            [("Value", "value"), ("Footprint", "footprint")]
+                .into_iter()
+                .filter_map(|(field, key)| {
+                    edit_spec[key]
+                        .as_str()
+                        .map(|value| (field.to_string(), value.to_string(), false))
+                })
+                .collect();
 
-        for (field, new_val) in specs {
-            let ranges = field_value_ranges(&content, reference, &field);
-            if ranges.is_empty() {
+        if let Some(extra) = extra {
+            for (name, value) in extra {
+                let Some(value) = value.as_str() else {
+                    errors.push(format!(
+                        "Field '{name}' on '{reference}' must have a string value"
+                    ));
+                    continue;
+                };
+                if name == "Reference" {
+                    errors.push(format!(
+                        "Field 'Reference' on '{reference}' cannot be edited through 'fields'"
+                    ));
+                    continue;
+                }
+                let may_create =
+                    create_missing && !matches!(name.as_str(), "Value" | "Footprint" | "Datasheet");
+                specs.push((name.clone(), value.to_string(), may_create));
+            }
+        }
+
+        for (field, new_val, may_create) in specs {
+            if !seen_assignments.insert((reference.to_string(), field.clone())) {
+                errors.push(format!(
+                    "Duplicate assignment for field '{field}' on '{reference}'"
+                ));
+                continue;
+            }
+
+            if !may_create && field_value_ranges(&content, reference, &field).is_empty() {
                 errors.push(format!("Field '{}' not found on '{}'", field, reference));
                 continue;
             }
-            let units = ranges.len();
-            for (start, end) in ranges {
-                file_edits.push(SexpEdit::replace(start, end, new_val.to_string()));
+
+            let (next, counts) =
+                match set_property_value(&content, reference, &field, &new_val, may_create) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        errors.push(error);
+                        continue;
+                    }
+                };
+            content = next;
+            updated_unit_copies += counts.updated;
+            created_unit_copies += counts.added;
+            if counts.updated > 0 {
+                updated_fields.insert(field.clone());
             }
+            if counts.added > 0 {
+                created_fields.insert(field.clone());
+            }
+            let units = counts.updated + counts.added;
             component_changes.push(if units > 1 {
                 format!("{} → {} ({} units)", field, new_val, units)
             } else {
                 format!("{} → {}", field, new_val)
             });
+            field_results.push(json!({
+                "name": field,
+                "value": new_val,
+                "updated_units": counts.updated,
+                "created_units": counts.added
+            }));
         }
 
         if !component_changes.is_empty() {
             changed.push(json!({
                 "reference": reference,
-                "changes": component_changes
+                "changes": component_changes,
+                "fields": field_results,
+                "updated_fields": updated_fields,
+                "created_fields": created_fields
             }));
         }
     }
 
-    let new_content = apply_edits(content, file_edits);
-    write_atomic_if_unchanged(&sch_path, &expected, &new_content)?;
+    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
 
     Ok(CallToolResult::json(&json!({
         "updated_count": changed.len(),
+        "updated_unit_copies": updated_unit_copies,
+        "created_unit_copies": created_unit_copies,
         "updated": changed,
         "errors": errors
     })))
@@ -3135,6 +3210,259 @@ mod multi_unit_handler_tests {
                 .value,
             original_r1
         );
+        assert_eq!(result["updated_unit_copies"], 6);
+        assert_eq!(result["created_unit_copies"], 0);
+        assert_eq!(result["updated"][0]["fields"][0]["updated_units"], 3);
+        assert_eq!(result["updated"][0]["fields"][1]["updated_units"], 3);
+    }
+
+    #[tokio::test]
+    async fn batch_edit_missing_custom_field_is_opt_in_and_multi_unit_safe() {
+        let schematic = fixture_file();
+        let original = std::fs::read_to_string(schematic.path()).unwrap();
+        let refused = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "edits": [{"reference": "U1", "fields": {"Tolerance": "1%"}}]
+            }),
+        )
+        .await;
+        assert_eq!(refused["updated_count"], 0);
+        assert_eq!(refused["created_unit_copies"], 0);
+        assert_eq!(
+            refused["errors"],
+            json!(["Field 'Tolerance' not found on 'U1'"])
+        );
+        assert_eq!(std::fs::read_to_string(schematic.path()).unwrap(), original);
+
+        let created = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [{"reference": "U1", "fields": {"Tolerance": "1%"}}]
+            }),
+        )
+        .await;
+        assert_eq!(created["updated_count"], 1);
+        assert_eq!(created["updated_unit_copies"], 0);
+        assert_eq!(created["created_unit_copies"], 3);
+        assert_eq!(
+            created["updated"][0]["created_fields"],
+            json!(["Tolerance"])
+        );
+        assert_eq!(created["updated"][0]["fields"][0]["created_units"], 3);
+        let committed = std::fs::read_to_string(schematic.path()).unwrap();
+        assert_eq!(
+            committed.matches(r#"(property "Tolerance" "1%""#).count(),
+            3
+        );
+        let units = instances(schematic.path())
+            .into_iter()
+            .filter(|instance| instance.reference == "U1")
+            .collect::<Vec<_>>();
+        let blocks = find_all_symbol_instance_blocks(&committed, "U1");
+        for ((start, end), unit) in blocks.into_iter().zip(units) {
+            let block = &committed[start..end];
+            let property = &block[block.find(r#"(property "Tolerance""#).unwrap()..];
+            assert!(
+                property.contains(&format!("(at {} {} 0)", unit.x, unit.y)),
+                "unit {} field was not anchored at its own placement",
+                unit.unit
+            );
+        }
+
+        let repeated = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [{"reference": "U1", "fields": {"Tolerance": "2%"}}]
+            }),
+        )
+        .await;
+        assert_eq!(repeated["updated_unit_copies"], 3);
+        assert_eq!(repeated["created_unit_copies"], 0);
+        let committed = std::fs::read_to_string(schematic.path()).unwrap();
+        assert_eq!(
+            committed.matches(r#"(property "Tolerance" "2%""#).count(),
+            3
+        );
+        assert!(!committed.contains(r#"(property "Tolerance" "1%""#));
+    }
+
+    #[tokio::test]
+    async fn batch_edit_creates_escaped_fields_for_multiple_components() {
+        let schematic = fixture_file();
+        let result = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [
+                    {"reference": "U1", "fields": {
+                        "Vendor Note": "line 1\n\"quoted\"\\path",
+                        "Tolerance": "5%"
+                    }},
+                    {"reference": "R1", "fields": {"Tolerance": "1%"}}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(result["updated_count"], 2);
+        assert_eq!(result["created_unit_copies"], 7);
+        assert_eq!(result["errors"], json!([]));
+        let committed = std::fs::read_to_string(schematic.path()).unwrap();
+        assert_eq!(
+            committed.matches(r#"(property "Tolerance" "5%""#).count(),
+            3
+        );
+        assert_eq!(
+            committed.matches(r#"(property "Tolerance" "1%""#).count(),
+            1
+        );
+        assert_eq!(
+            committed
+                .matches(r#"(property "Vendor Note" "line 1\n\"quoted\"\\path""#)
+                .count(),
+            3
+        );
+        read_schematic(schematic.path()).expect("escaped property remains valid KiCad syntax");
+    }
+
+    #[tokio::test]
+    async fn batch_edit_rejects_non_string_reference_and_duplicate_assignments() {
+        let schematic = fixture_file();
+        let original = std::fs::read_to_string(schematic.path()).unwrap();
+        let result = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [
+                    {"reference": "U1", "fields": {
+                        "Count": 3,
+                        "Reference": "U99",
+                        "Value": "first"
+                    }},
+                    {"reference": "U1", "value": "second"}
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(result["updated_count"], 1);
+        assert_eq!(result["created_unit_copies"], 0);
+        assert_eq!(result["updated_unit_copies"], 3);
+        let errors = result["errors"].as_array().unwrap();
+        assert!(errors
+            .iter()
+            .any(|error| error.as_str().unwrap().contains("must have a string value")));
+        assert!(errors
+            .iter()
+            .any(|error| error.as_str().unwrap().contains("cannot be edited")));
+        assert!(errors
+            .iter()
+            .any(|error| error.as_str().unwrap().contains("Duplicate assignment")));
+
+        let committed = std::fs::read_to_string(schematic.path()).unwrap();
+        assert_eq!(
+            committed.matches(r#"(property "Reference" "U1""#).count(),
+            3
+        );
+        assert_eq!(committed.matches(r#"(property "Value" "first""#).count(), 3);
+        assert!(!committed.contains(r#"(property "Value" "second""#));
+        assert_ne!(
+            committed, original,
+            "the valid first assignment still applies"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_edit_repairs_a_partially_populated_multi_unit_field() {
+        let schematic = fixture_file();
+        call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [{"reference": "U1", "fields": {"Tolerance": "1%"}}]
+            }),
+        )
+        .await;
+
+        let content = std::fs::read_to_string(schematic.path()).unwrap();
+        let first_unit = find_all_symbol_instance_blocks(&content, "U1")[0];
+        let relative = content[first_unit.0..first_unit.1]
+            .find(r#"(property "Tolerance" "1%""#)
+            .unwrap();
+        let property_start = first_unit.0 + relative;
+        let (_, property_end) = konnect_sexp::writer::find_balanced_block(&content, property_start)
+            .expect("the inserted property is balanced");
+        let partial = apply_edits(
+            content,
+            vec![SexpEdit::delete(property_start, property_end)],
+        );
+        std::fs::write(schematic.path(), partial).unwrap();
+
+        let repaired = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [{"reference": "U1", "fields": {"Tolerance": "2%"}}]
+            }),
+        )
+        .await;
+        assert_eq!(repaired["updated_unit_copies"], 2);
+        assert_eq!(repaired["created_unit_copies"], 1);
+        assert_eq!(repaired["updated"][0]["fields"][0]["updated_units"], 2);
+        assert_eq!(repaired["updated"][0]["fields"][0]["created_units"], 1);
+        let committed = std::fs::read_to_string(schematic.path()).unwrap();
+        assert_eq!(
+            committed.matches(r#"(property "Tolerance" "2%""#).count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_edit_preserves_crlf_when_creating_fields() {
+        let mut schematic = tempfile::NamedTempFile::with_suffix(".kicad_sch").unwrap();
+        let crlf = ECC83.replace('\n', "\r\n");
+        schematic.write_all(crlf.as_bytes()).unwrap();
+        schematic.flush().unwrap();
+
+        let result = call(
+            schematic.path(),
+            "batch_edit_schematic_components",
+            json!({
+                "create_missing": true,
+                "edits": [{"reference": "U1", "fields": {"Tolerance": "1%"}}]
+            }),
+        )
+        .await;
+        assert_eq!(result["created_unit_copies"], 3);
+        let committed = std::fs::read_to_string(schematic.path()).unwrap();
+        assert!(!committed.replace("\r\n", "").contains('\n'));
+        assert_eq!(
+            committed.matches("\r\n\t\t(property \"Tolerance\"").count(),
+            3
+        );
+    }
+
+    #[test]
+    fn batch_edit_candidate_refuses_a_concurrent_revision() {
+        let schematic = fixture_file();
+        let expected = read_consistent(schematic.path()).unwrap();
+        let (candidate, counts) =
+            set_property_value(&expected, "U1", "Tolerance", "1%", true).unwrap();
+        assert_eq!(counts.added, 3);
+
+        let external = format!("{expected}\n; external edit\n");
+        std::fs::write(schematic.path(), &external).unwrap();
+        let error = write_atomic_if_unchanged(schematic.path(), &expected, &candidate).unwrap_err();
+        assert!(matches!(error, konnect_sexp::SexpError::Conflict { .. }));
+        assert_eq!(std::fs::read_to_string(schematic.path()).unwrap(), external);
     }
 
     #[tokio::test]

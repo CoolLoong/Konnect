@@ -219,6 +219,12 @@ Connect multiple pins to the same net in one call. Ideal for:
 ### batch_edit_schematic_components
 
 Bulk-modify component properties (values, footprints, fields) across multiple components.
+The default remains update-only. Set `create_missing: true` to create a missing
+custom field on every placed unit of each named component. `Reference`, `Value`,
+`Footprint` and `Datasheet` are never created through this option; use the
+dedicated arguments or workflows for built-in fields. Inspect each result's
+“updated_units” and “created_units” counts, because a partially populated
+multi-unit component can report both.
 
 ### When to Use Batch vs Individual
 

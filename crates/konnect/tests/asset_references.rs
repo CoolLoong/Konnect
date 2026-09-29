@@ -726,6 +726,9 @@ fn backticked_tool_names_in_prose_exist_in_the_registry() {
         // Structured schematic-placement response fields, not callable tools.
         "junctions_added_count",
         "junctions_pruned_count",
+        // Structured batch-field response counts, not callable tools (#258).
+        "updated_units",
+        "created_units",
         // Structured DRC ownership response field and its unresolved values,
         // not callable tools (#413).
         "ownership_status",
