@@ -28,6 +28,35 @@ no force-push or deletion, and merge commits only. Auto-merge is enabled for a
 maintainer to arm after exact-head review, and merged topic branches are deleted
 automatically.
 
+## Review requests and completion
+
+CODEOWNERS automatically requests its listed owners, including `@mixelpixx` on
+most PRs. The ruleset requires **zero approving reviews** and does not require a
+code-owner review. A pending request is therefore not a merge blocker or proof
+that no maintainer has reviewed the PR. The one `status:*` label names the next
+actor; a review of an obsolete head cannot make the current head ready.
+
+When a maintainer finishes a substantive review of someone else's exact PR
+head, submit one GitHub **comment review** recording the head, findings or
+no-findings conclusion, and next actor (for example,
+`gh pr review N --comment --body "Reviewed head ..."`). Use ordinary PR comments
+for follow-up discussion.
+GitHub does not allow an author to review their own PR; in that case record the
+same assessment in an ordinary PR comment. A comment review is a review record,
+not an approval to merge or a replacement for required checks, resolved threads,
+issue accounting, or the queue. Do not submit an approval merely to clear a
+request, and do not confuse an existing `CHANGES_REQUESTED` review with a pending
+request.
+
+After the review, inspect outstanding requests. If one came automatically from
+CODEOWNERS (`asCodeOwner: true` in GitHub's review-request data), a maintainer
+may remove it **only** when the reviewed maintainer has taken responsibility
+and the requested owner has no explicit decision pending. Keep manually
+requested reviews and requests involving unresolved scope, release, licensing,
+or other owner decisions. Verify that the intended request disappeared; if it
+returns after a new push, review the new head before clearing it again. Never
+remove a request merely to make an unreviewed PR look complete.
+
 ## Default: one independent change
 
 Use an independent branch when a change can be reviewed and merged without

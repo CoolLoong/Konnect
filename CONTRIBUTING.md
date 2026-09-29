@@ -111,6 +111,12 @@ head and marked it `status:ready-to-merge`, they may enable auto-merge while che
 finishing. Auto-merge is the last execution step; it is not review and does not make a
 stale, cumulative, or poorly evidenced PR ready.
 
+CODEOWNERS may automatically request Chris's review even when another maintainer
+handles the routine review. That request is a notification, not an extra approval
+gate. The [review-request workflow](docs/BRANCH_AND_PULL_REQUEST_WORKFLOW.md#review-requests-and-completion)
+explains how the maintainer records a completed review and clears only a stale
+automatic request; it never dismisses a specific owner decision or review finding.
+
 If you push after that review, assume the readiness decision is invalid. GitHub may
 disable auto-merge automatically for a new commit from a fork. Resolve new feedback,
 bring the branch back to current `upstream/main` when required, rerun the evidence, and
