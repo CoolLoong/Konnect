@@ -151,8 +151,10 @@ connect_to_net(schematic, reference, pin_number, net)
 - Name the pin rather than passing `pin_x`/`pin_y`: the stub then points away
   from the symbol body on its own, instead of the label text running back
   across the pin names. Override with `direction` only to fix a layout clash.
-- `batch_connect_to_net` does the same for many pins in one read/write, and
-  places its labels directly on the pin endpoints without stubs.
+- `batch_connect_to_net` does the same for many pins in one read/write. By
+  default it places its labels directly on the pin endpoints without stubs;
+  pass `stub_length`, `direction` and `label_type` for `connect_to_net`'s
+  layout on every pin in the call.
 - Placing a label by hand with `add_schematic_net_label` instead? Take its
   rotation from `orientation_degrees` in `get_schematic_pin_locations`, or the
   text reads back across the symbol's pin names.

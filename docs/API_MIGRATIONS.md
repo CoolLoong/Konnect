@@ -88,6 +88,34 @@ behavior they had. Existing response fields keep their names and their meanings.
 No tool, argument, or existing response field was renamed or removed. This
 additive schema and response change is planned for the next minor release.
 
+## Unreleased: `batch_connect_to_net` takes `connect_to_net`'s placement options (minor release)
+
+`batch_connect_to_net` could only put a local label on each pin endpoint.
+`connect_to_net` draws a wire stub, lets the caller choose its direction and
+can place a global label, so a sheet built with the batch tool looked
+different from one built pin by pin (#701).
+
+The batch tool now takes `stub_length`, `direction` and `label_type`. Each one
+applies to every pin in the call, and an explicit value places exactly what
+`connect_to_net` places with the same value. The defaults keep the old output:
+`stub_length: 0` (label on the endpoint, no wire), `direction: "auto"` and
+`label_type: "net_label"`. `stub_length` must be `0` or more. Unlike
+`connect_to_net`, `0` draws no wire at all rather than a zero-length one.
+
+Each pin gets its own stub wire. Where a label of the net already sits at a
+stub's end, from the file or from an earlier pin in the call, the batch reuses
+that label instead of stacking a second one. An entry is `deduplicated` only
+when the pin's wire and label both already exist.
+
+`net` is accepted as an alias of `net_name`. Giving both with different values
+is refused with `invalid_argument` on `net`, and nothing is written. Giving
+neither is `invalid_argument` on `net_name`, as before.
+
+A call that uses the defaults gets the same response as before. When any
+option differs from its default, each `added` entry also reports `direction`,
+`label` (`x`, `y`, `rotation`) and, for a drawn stub, `wire`. The top level
+then also reports `stub_length` and `label_type`.
+
 ## Unreleased: an omitted reference keeps the library prefix (patch release)
 
 `add_schematic_component` and `batch_place_components` wrote a bare `?` when

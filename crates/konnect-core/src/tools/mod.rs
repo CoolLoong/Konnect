@@ -1243,6 +1243,13 @@ pub(crate) struct StubDirection {
     pub label_rotation: f64,
 }
 
+impl StubDirection {
+    /// Where a stub of `length` mm from `anchor` ends, and its label sits.
+    pub(crate) fn end(&self, (x, y): (f64, f64), length: f64) -> (f64, f64) {
+        (x + self.dx * length, y + self.dy * length)
+    }
+}
+
 /// Resolve a `direction` argument against an already-known outward direction.
 /// `"auto"` follows `outward`, falling back to `"right"` — the default before
 /// `"auto"` existed — when the caller could not determine one.
