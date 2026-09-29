@@ -149,7 +149,8 @@ pub fn tools() -> Vec<ToolDef> {
              positions are millimetres on the sheet; the response's `coordinates` \
              object says whether they were corrected for the KiCad versions that \
              report them 100x too small, passed through, or withheld because the \
-             KiCad version could not be classified.",
+             KiCad version could not be classified. A report that is not in \
+             kicad-cli's ERC shape is an error, never zero violations.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1869,7 +1870,7 @@ mod erc_response_tests {
                 raw.as_object_mut().unwrap().remove("kicad_version");
             }
         }
-        cli::parse_erc_json(&raw)
+        cli::parse_erc_json(&raw).unwrap()
     }
 
     /// A caller reading `x`/`y` gets a location it can find on the sheet, and
