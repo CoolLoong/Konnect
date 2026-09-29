@@ -2340,9 +2340,9 @@ mod erc_report_shape_dispatch_tests {
     use super::*;
     use crate::tools::ServerConfig;
 
-    /// A blank KiCad schematic: enough for `run_erc` to accept it as a project
-    /// root before it reaches the stand-in kicad-cli.
-    const BLANK_SCHEMATIC: &str = "(kicad_sch\n\t(version 20250114)\n\t(generator \"eeschema\")\n\t(generator_version \"9.0\")\n\t(uuid \"6f1c2f0a-3b7e-4c55-9a53-0d6c5c1f7a11\")\n\t(paper \"A4\")\n\t(lib_symbols)\n\t(sheet_instances\n\t\t(path \"/\"\n\t\t\t(page \"1\")\n\t\t)\n\t)\n)\n";
+    /// KiCad-authored fixture copied from the official `complex_hierarchy` demo.
+    const KICAD_AUTHORED_SCHEMATIC: &str =
+        include_str!("../../tests/fixtures/project_ownership/complex_hierarchy.kicad_sch");
 
     /// A stand-in kicad-cli that exits 0 and writes `report` to the `--output`
     /// path (`sch erc --output <path> …`, so the fourth argument).
@@ -2359,7 +2359,7 @@ mod erc_report_shape_dispatch_tests {
         let control = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();
         let schematic = project.path().join("clock.kicad_sch");
-        std::fs::write(&schematic, BLANK_SCHEMATIC).unwrap();
+        std::fs::write(&schematic, KICAD_AUTHORED_SCHEMATIC).unwrap();
         let cli = erc_cli_writing(control.path(), stem, report);
 
         let handler = McpHandler::new(ServerConfig {
