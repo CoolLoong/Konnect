@@ -4,6 +4,7 @@ mod board_session;
 mod board_source;
 #[cfg(test)]
 mod board_source_contract_tests;
+mod board_stackup;
 pub mod cli;
 pub mod config;
 pub(crate) mod cross_probe;

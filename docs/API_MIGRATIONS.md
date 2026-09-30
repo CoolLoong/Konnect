@@ -3,6 +3,22 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: reading the board's physical stackup (minor release)
+
+The `pcb_board` toolset adds `get_board_stackup`. It reads the physical
+stackup of the board KiCad holds open through `GetBoardStackup`: each layer's
+type, thickness and material, dielectric εr and loss tangent, the copper
+finish, impedance control, edge settings, and the board thickness KiCad
+computes from the stack.
+
+`findings` lists fabrication values the board leaves unspecified and, when the
+optional `expected` stackup is given, every value that differs from it. The
+tool is read-only and requires the requested board to be open in KiCad; it
+never reads the board file in its place. KiCad 10 declares
+`UpdateBoardStackup` but does not implement it, so changes are made in Board
+Setup (#716). This is an additive tool and response surface planned for the
+next minor release.
+
 ## Unreleased: opt-in custom fields in `batch_edit_schematic_components` (minor release)
 
 `batch_edit_schematic_components` adds an optional `create_missing` boolean,

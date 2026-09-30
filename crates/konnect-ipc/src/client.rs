@@ -325,6 +325,119 @@ fn unpack_any<M: Message + Default>(any: &prost_types::Any) -> Result<M> {
     M::decode(any.value.as_slice()).context("Failed to decode protobuf Any body")
 }
 
+/// A `BoardStackup` as the crate's own types.
+///
+/// Field for field what KiCad 10.0.6's `BOARD_STACKUP::Serialize` fills: a
+/// copper layer's material is always "copper"; a dielectric's materials, εr and
+/// loss tangents are per sub-layer; a solder mask carries its own εr and loss
+/// tangent; a color is present only when the board specifies one.
+fn stackup_from_proto(stackup: &kiapi::board::BoardStackup) -> IpcBoardStackup {
+    use kiapi::board::board_stackup_layer::Details;
+    use kiapi::board::{BoardEdgeConnectorType, BoardStackupDielectricType, BoardStackupLayerType};
+
+    let nm = |d: &Option<kiapi::common::types::Distance>| d.as_ref().map_or(0, |d| d.value_nm);
+    let hex = |c: &kiapi::common::types::Color| {
+        let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!(
+            "#{:02X}{:02X}{:02X}{:02X}",
+            byte(c.r),
+            byte(c.g),
+            byte(c.b),
+            byte(c.a)
+        )
+    };
+
+    let layers = stackup
+        .layers
+        .iter()
+        .map(|layer| {
+            let kind = match BoardStackupLayerType::try_from(layer.r#type) {
+                Ok(BoardStackupLayerType::BsltCopper) => "copper",
+                Ok(BoardStackupLayerType::BsltDielectric) => "dielectric",
+                Ok(BoardStackupLayerType::BsltSoldermask) => "soldermask",
+                Ok(BoardStackupLayerType::BsltSilkscreen) => "silkscreen",
+                Ok(BoardStackupLayerType::BsltSolderpaste) => "solderpaste",
+                _ => "undefined",
+            };
+            // A dielectric has no board layer; KiCad sends BL_UNDEFINED for it.
+            let board_layer = kiapi::board::types::BoardLayer::try_from(layer.layer)
+                .ok()
+                .and_then(crate::builders::layer_name)
+                .map(str::to_string);
+            let mut out = IpcStackupLayer {
+                layer: board_layer,
+                user_name: Some(layer.user_name.clone()).filter(|n| !n.is_empty()),
+                kind: kind.to_string(),
+                enabled: layer.enabled,
+                thickness_nm: nm(&layer.thickness),
+                material: layer.material_name.clone(),
+                color: layer.color.as_ref().map(hex),
+                dielectric_type: None,
+                dielectric: Vec::new(),
+                epsilon_r: None,
+                loss_tangent: None,
+            };
+            match &layer.details {
+                Some(Details::Dielectric(dielectric)) => {
+                    out.dielectric_type = Some(
+                        match BoardStackupDielectricType::try_from(dielectric.r#type) {
+                            Ok(BoardStackupDielectricType::BsdtCore) => "core",
+                            Ok(BoardStackupDielectricType::BsdtPrepreg) => "prepreg",
+                            Ok(BoardStackupDielectricType::BsdtNone) => "none",
+                            _ => "unknown",
+                        }
+                        .to_string(),
+                    );
+                    out.dielectric = dielectric
+                        .layer
+                        .iter()
+                        .map(|sub| IpcStackupDielectric {
+                            thickness_nm: nm(&sub.thickness),
+                            material: sub.material_name.clone(),
+                            epsilon_r: sub.epsilon_r,
+                            loss_tangent: sub.loss_tangent,
+                            thickness_locked: sub.thickness_locked,
+                        })
+                        .collect();
+                }
+                Some(Details::Soldermask(mask)) => {
+                    out.material = mask.material_name.clone();
+                    out.epsilon_r = Some(mask.epsilon_r);
+                    out.loss_tangent = Some(mask.loss_tangent);
+                    out.thickness_nm = nm(&mask.thickness);
+                }
+                Some(Details::Silkscreen(silk)) => out.material = silk.material_name.clone(),
+                None => {}
+            }
+            out
+        })
+        .collect();
+
+    let edge = stackup.edge.as_ref();
+    IpcBoardStackup {
+        finish: stackup
+            .finish
+            .as_ref()
+            .map(|f| f.type_name.clone())
+            .unwrap_or_default(),
+        impedance_controlled: stackup.impedance.as_ref().is_some_and(|i| i.is_controlled),
+        edge_connector: match edge
+            .and_then(|e| e.connector.as_ref())
+            .map(|c| BoardEdgeConnectorType::try_from(c.r#type))
+        {
+            Some(Ok(BoardEdgeConnectorType::BectNone)) => "none",
+            Some(Ok(BoardEdgeConnectorType::BectPlain)) => "plain",
+            Some(Ok(BoardEdgeConnectorType::BectBeveled)) => "beveled",
+            _ => "unknown",
+        }
+        .to_string(),
+        has_edge_plating: edge
+            .and_then(|e| e.plating.as_ref())
+            .is_some_and(|p| p.has_edge_plating),
+        layers,
+    }
+}
+
 /// Decode an item only when it carries `type_name`. protobuf decoding is
 /// lenient — a `BoardText` body decodes as a `BoardGraphicShape` without
 /// error, yielding an item with no geometry and an empty UUID — so the
@@ -3989,6 +4102,50 @@ impl KiCadIpcClient {
         Ok(resp.name)
     }
 
+    /// The requested board's physical stackup, top to bottom, through
+    /// `GetBoardStackup`.
+    ///
+    /// KiCad serves the board's own stackup, or its default one when the board
+    /// defines none, and the answer does not say which. KiCad 10 declares
+    /// `UpdateBoardStackup` but does not implement it, so this is read-only.
+    pub fn get_board_stackup_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<IpcBoardStackup> {
+        let any = self.get_board_stackup_response_in(document)?;
+        let resp: kiapi::board::commands::BoardStackupResponse = unpack_any(&any)?;
+        let stackup = resp
+            .stackup
+            .context("KiCad's BoardStackupResponse carries no stackup")?;
+        Ok(stackup_from_proto(&stackup))
+    }
+
+    /// KiCad's `GetBoardStackup` answer for the requested board as KiCad sent
+    /// it, checked to be a `BoardStackupResponse` and not decoded, as
+    /// [`Self::get_items_in`] returns items. A capture of KiCad's own message
+    /// is taken from this.
+    pub fn get_board_stackup_response_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+    ) -> Result<prost_types::Any> {
+        let cmd = kiapi::board::commands::GetBoardStackup {
+            board: Some(document),
+        };
+        let resp_any = self.send_command(&cmd, "kiapi.board.commands.GetBoardStackup")?;
+        // Every board has copper, so an `AS_OK` with no body is KiCad declining
+        // to answer, not a board without a stackup.
+        let Some(any) = resp_any else {
+            anyhow::bail!("KiCad returned no stackup for the requested board");
+        };
+        if !crate::builders::any_is(&any, "kiapi.board.commands.BoardStackupResponse") {
+            anyhow::bail!(
+                "KiCad answered GetBoardStackup with '{}', not a BoardStackupResponse",
+                any.type_url
+            );
+        }
+        Ok(any)
+    }
+
     /// Run an arbitrary tool action in KiCAD (e.g. to trigger a refresh).
     pub fn run_action(&self, action: &str) -> Result<()> {
         let cmd = kiapi::common::commands::RunAction {
@@ -5848,5 +6005,172 @@ mod footprint_graphic_tests {
             (anchor.0, anchor.1 - builders::mm_to_nm(2.0)),
             "local +X must rotate to board -Y"
         );
+    }
+}
+
+#[cfg(test)]
+mod stackup_tests {
+    use super::*;
+    use kiapi::board::board_stackup_layer::Details;
+    use kiapi::board::types::BoardLayer;
+    use kiapi::board::{
+        BoardEdgeConnector, BoardEdgeConnectorType, BoardEdgeSettings, BoardFinish,
+        BoardImpedanceControl, BoardStackup, BoardStackupDielectricLayer,
+        BoardStackupDielectricProperties, BoardStackupDielectricType, BoardStackupLayer,
+        BoardStackupLayerType, BoardStackupSilkscreenLayer, BoardStackupSoldermaskLayer,
+        EdgePlating,
+    };
+    use kiapi::common::types::{Color, Distance};
+
+    fn nm(value_nm: i64) -> Option<Distance> {
+        Some(Distance { value_nm })
+    }
+
+    fn entry(layer: BoardLayer, kind: BoardStackupLayerType, thickness: i64) -> BoardStackupLayer {
+        BoardStackupLayer {
+            thickness: nm(thickness),
+            layer: layer as i32,
+            enabled: true,
+            r#type: kind as i32,
+            ..Default::default()
+        }
+    }
+
+    fn sample() -> BoardStackup {
+        let mut silk = entry(
+            BoardLayer::BlFSilkS,
+            BoardStackupLayerType::BsltSilkscreen,
+            0,
+        );
+        silk.user_name = "F.Silkscreen".into();
+        silk.details = Some(Details::Silkscreen(BoardStackupSilkscreenLayer {
+            material_name: "Not specified".into(),
+        }));
+
+        let mut mask = entry(
+            BoardLayer::BlFMask,
+            BoardStackupLayerType::BsltSoldermask,
+            10_000,
+        );
+        mask.color = Some(Color {
+            r: 0.0,
+            g: 0.5,
+            b: 0.0,
+            a: 1.0,
+        });
+        mask.details = Some(Details::Soldermask(BoardStackupSoldermaskLayer {
+            epsilon_r: 3.3,
+            loss_tangent: 0.0,
+            material_name: "Not specified".into(),
+            thickness: nm(10_000),
+        }));
+
+        let mut copper = entry(BoardLayer::BlFCu, BoardStackupLayerType::BsltCopper, 35_000);
+        copper.material_name = "copper".into();
+
+        // KiCad sends BL_UNDEFINED for a dielectric; this slot has two sub-layers.
+        let mut core = entry(
+            BoardLayer::BlUndefined,
+            BoardStackupLayerType::BsltDielectric,
+            200_000,
+        );
+        core.details = Some(Details::Dielectric(BoardStackupDielectricLayer {
+            layer: vec![
+                BoardStackupDielectricProperties {
+                    epsilon_r: 4.5,
+                    loss_tangent: 0.02,
+                    material_name: "FR4".into(),
+                    thickness: nm(200_000),
+                    thickness_locked: true,
+                    ..Default::default()
+                },
+                BoardStackupDielectricProperties {
+                    epsilon_r: 4.4,
+                    loss_tangent: 0.018,
+                    material_name: "FR4".into(),
+                    thickness: nm(100_000),
+                    ..Default::default()
+                },
+            ],
+            r#type: BoardStackupDielectricType::BsdtCore as i32,
+        }));
+
+        let mut inner = entry(
+            BoardLayer::BlIn1Cu,
+            BoardStackupLayerType::BsltCopper,
+            15_200,
+        );
+        inner.enabled = false;
+
+        BoardStackup {
+            finish: Some(BoardFinish {
+                type_name: "ENIG".into(),
+            }),
+            impedance: Some(BoardImpedanceControl {
+                is_controlled: true,
+            }),
+            edge: Some(BoardEdgeSettings {
+                connector: Some(BoardEdgeConnector {
+                    r#type: BoardEdgeConnectorType::BectBeveled as i32,
+                }),
+                castellation: None,
+                plating: Some(EdgePlating {
+                    has_edge_plating: true,
+                }),
+            }),
+            layers: vec![silk, mask, copper, core, inner],
+        }
+    }
+
+    #[test]
+    fn every_serialized_field_reaches_the_crate_type() {
+        let stackup = stackup_from_proto(&sample());
+
+        assert_eq!(stackup.finish, "ENIG");
+        assert!(stackup.impedance_controlled);
+        assert_eq!(stackup.edge_connector, "beveled");
+        assert!(stackup.has_edge_plating);
+
+        let [silk, mask, copper, core, inner] = stackup.layers.as_slice() else {
+            panic!("five entries, in order: {:?}", stackup.layers);
+        };
+        assert_eq!(silk.layer.as_deref(), Some("F.SilkS"));
+        assert_eq!(silk.kind, "silkscreen");
+        assert_eq!(silk.user_name.as_deref(), Some("F.Silkscreen"));
+        assert_eq!(silk.material, "Not specified");
+        assert_eq!(silk.color, None, "no color unless the board specifies one");
+
+        assert_eq!(mask.layer.as_deref(), Some("F.Mask"));
+        assert_eq!(mask.kind, "soldermask");
+        assert_eq!(mask.thickness_nm, 10_000);
+        assert_eq!(mask.epsilon_r, Some(3.3));
+        assert_eq!(mask.loss_tangent, Some(0.0));
+        assert_eq!(mask.color.as_deref(), Some("#008000FF"));
+
+        assert_eq!(copper.layer.as_deref(), Some("F.Cu"));
+        assert_eq!(copper.material, "copper");
+        assert_eq!(copper.thickness_nm, 35_000);
+        assert_eq!(copper.epsilon_r, None);
+
+        assert_eq!(core.layer, None, "a dielectric is not a board layer");
+        assert_eq!(core.kind, "dielectric");
+        assert_eq!(core.dielectric_type.as_deref(), Some("core"));
+        assert_eq!(core.dielectric.len(), 2);
+        assert_eq!(core.dielectric[1].thickness_nm, 100_000);
+        assert_eq!(core.dielectric[1].epsilon_r, 4.4);
+        assert!(core.dielectric[0].thickness_locked);
+
+        assert_eq!(inner.layer.as_deref(), Some("In1.Cu"));
+        assert!(!inner.enabled);
+    }
+
+    #[test]
+    fn a_stackup_with_no_finish_or_edge_settings_reads_as_unset() {
+        let stackup = stackup_from_proto(&BoardStackup::default());
+        assert_eq!(stackup.finish, "");
+        assert!(!stackup.impedance_controlled);
+        assert_eq!(stackup.edge_connector, "unknown");
+        assert!(!stackup.has_edge_plating);
+        assert!(stackup.layers.is_empty());
     }
 }
