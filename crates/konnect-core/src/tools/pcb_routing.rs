@@ -88,6 +88,36 @@ pub fn tools() -> Vec<ToolDef> {
         )
         .with_board_access(crate::tools::BoardAccess::LiveOnly),
         tool!(
+            "delete_via",
+            "Delete one observed via UUID from the exact live KiCad board. Refuses missing or non-via targets before writing; success requires independent absence readback. Does not save the board. Inspect the target before retrying an uncertain outcome.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Exact open .kicad_pcb path" },
+                    "uuid": { "type": "string", "minLength": 1 }
+                },
+                "required": ["board", "uuid"]
+            }),
+            |args, ctx| async move { handle_delete_via(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
+            "move_via",
+            "Move one observed via UUID on the exact live KiCad board to x/y in mm. Preserves and independently verifies every other typed via property. Refuses unmodeled protobuf fields before writing. Does not save the board; inspect before retrying an uncertain outcome.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "board": { "type": "string", "description": "Exact open .kicad_pcb path" },
+                    "uuid": { "type": "string", "minLength": 1 },
+                    "x": { "type": "number", "minimum": -2147.483648, "maximum": 2147.483647, "description": "Target center X in mm (rounded to nm)" },
+                    "y": { "type": "number", "minimum": -2147.483648, "maximum": 2147.483647, "description": "Target center Y in mm (rounded to nm)" }
+                },
+                "required": ["board", "uuid", "x", "y"]
+            }),
+            |args, ctx| async move { handle_move_via(args, ctx).await }
+        )
+        .with_board_access(crate::tools::BoardAccess::LiveOnly),
+        tool!(
             "route_pad_to_pad",
             "Route a direct trace between two pads of named components (L-bend routing) via KiCAD IPC.",
             json!({
@@ -1014,6 +1044,179 @@ async fn handle_add_copper_pour(
     ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     crate::tools::pcb_board::add_zone_impl(args, ctx).await
+}
+
+async fn handle_delete_via(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    handle_via_mutation(args, ctx, false).await
+}
+
+async fn handle_move_via(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+) -> anyhow::Result<CallToolResult> {
+    handle_via_mutation(args, ctx, true).await
+}
+
+fn via_json_error(body: &serde_json::Value) -> CallToolResult {
+    let mut result = CallToolResult::json(body);
+    result.is_error = true;
+    result
+}
+
+fn via_evidence(via: &konnect_ipc::gen::kiapi::board::types::Via) -> serde_json::Value {
+    let position = via.position.as_ref();
+    let stack = via.pad_stack.as_ref();
+    let drill = stack.and_then(|stack| stack.drill.as_ref());
+    json!({
+        "uuid": via.id.as_ref().map(|id| id.value.as_str()),
+        "position": position.map(|p| json!({"x": konnect_ipc::builders::nm_to_mm(p.x_nm), "y": konnect_ipc::builders::nm_to_mm(p.y_nm)})),
+        "net": via.net.as_ref().map(|net| json!({"name": net.name, "code": net.code.as_ref().map(|code| code.value)})),
+        "locked": via.locked,
+        "via_type": via.r#type,
+        "drill_nm": drill.and_then(|d| d.diameter.as_ref()).map(|d| json!({"x": d.x_nm, "y": d.y_nm})),
+        "layer_pair": drill.map(|d| json!([d.start_layer, d.end_layer])),
+        "pad_sizes_nm": stack.map(|s| s.copper_layers.iter().map(|layer| json!({"layer": layer.layer, "size": layer.size.as_ref().map(|size| json!({"x": size.x_nm, "y": size.y_nm}))})).collect::<Vec<_>>()),
+        "protobuf_type": "kiapi.board.types.Via",
+        // Complete preimage, including typed properties not summarized above.
+        "protobuf_hex": via.encode_to_vec().iter().map(|byte| format!("{byte:02x}")).collect::<String>()
+    })
+}
+
+async fn handle_via_mutation(
+    args: &serde_json::Value,
+    ctx: &ToolContext,
+    is_move: bool,
+) -> anyhow::Result<CallToolResult> {
+    use crate::outcome::{self, OutcomeStatus};
+    use konnect_ipc::IpcViaMutationOutcome::{Applied, Missing, Uncertain};
+    let board = get_path(args, "board")?;
+    let failed = |result| {
+        outcome::attach(
+            result,
+            outcome::summary(
+                OutcomeStatus::Failed,
+                board.display().to_string(),
+                "kicad_ipc",
+                1,
+                0,
+                1,
+                Some(outcome::retry_whole_request()),
+            ),
+        )
+    };
+    let uuid = match require_str(args, "uuid") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        Ok(_) => {
+            return Ok(failed(crate::tools::invalid_arg(
+                "uuid",
+                "must not be empty",
+            )))
+        }
+        Err(error) => return Ok(failed(error)),
+    };
+    let position = if is_move {
+        let mut coordinates = Vec::new();
+        for field in ["x", "y"] {
+            let value = match require_f64(args, field) {
+                Ok(value) => value,
+                Err(error) => return Ok(failed(error)),
+            };
+            // KiCad board coordinates are signed 32-bit IU, despite Vector2's
+            // wider wire representation. Validate before any narrowing cast.
+            if !value.is_finite() || !(-2147.483648..=2147.483647).contains(&value) {
+                return Ok(failed(crate::tools::invalid_arg(
+                    field,
+                    "must fit KiCad's signed 32-bit nanometre coordinate range",
+                )));
+            }
+            coordinates.push((value * 1_000_000.0).round() as i64);
+        }
+        Some(konnect_ipc::gen::kiapi::common::types::Vector2 {
+            x_nm: coordinates[0],
+            y_nm: coordinates[1],
+        })
+    } else {
+        None
+    };
+    let uuid_ipc = uuid.clone();
+    let result =
+        with_bound_board_ipc_classified(ctx, &board, move |client, document| match position {
+            Some(position) => client.move_via_verified_in(document, &uuid_ipc, position),
+            None => client.delete_via_verified_in(document, &uuid_ipc),
+        })
+        .await?;
+    let result = match result {
+        Ok(BoardBinding::Bound(result)) => result,
+        Err(konnect_ipc::IpcFailure::Target { error, .. }) => {
+            return Ok(failed(crate::tools::ipc_target_error_result(&error)))
+        }
+        Ok(BoardBinding::Unserved { message, .. }) => {
+            return Ok(failed(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: message.clone(),
+                },
+                format!("Via mutation refused before writing: {message}"),
+            )))
+        }
+        Err(error) => {
+            return Ok(failed(CallToolResult::error_kind(
+                ToolErrorKind::HandlerError {
+                    reason: error.message().to_owned(),
+                },
+                format!("Via mutation failed before writing: {}", error.message()),
+            )))
+        }
+    };
+    let operation = if is_move { "move_via" } else { "delete_via" };
+    Ok(match result {
+        Missing => failed(CallToolResult::error_kind(
+            ToolErrorKind::StaleTarget {
+                target: uuid,
+                reason: "UUID is not an observed via on the requested board".to_owned(),
+            },
+            "Via target is missing or is not a via. No board item was changed.",
+        )),
+        Applied {
+            before,
+            after,
+            changed,
+        } => outcome::attach(
+            CallToolResult::json(&json!({
+                "operation": operation, "uuid": before.id.as_ref().map(|id| id.value.as_str()),
+                "changed": changed, "saved": false,
+                "preimage": via_evidence(&before), "readback": after.as_deref().map(via_evidence),
+                "postcondition": if is_move { "position_and_all_other_via_properties_verified" } else { "absent_from_complete_via_readback" }
+            })),
+            outcome::summary(
+                OutcomeStatus::Complete,
+                board.display().to_string(),
+                "kicad_ipc_independent_readback",
+                1,
+                1,
+                0,
+                None,
+            ),
+        ),
+        Uncertain { before, reason } => outcome::attach(
+            via_json_error(&json!({
+                "message": format!("{operation} may have changed the live board. Inspect UUID '{uuid}' before retrying. {reason}"),
+                "error": ToolErrorKind::MutationOutcomeUncertain { operation: operation.to_owned(), path: board.display().to_string(), reason },
+                "uuid": uuid, "preimage": via_evidence(&before), "saved": false
+            })),
+            outcome::summary(
+                OutcomeStatus::Uncertain,
+                board.display().to_string(),
+                "kicad_ipc",
+                1,
+                0,
+                1,
+                Some(outcome::inspect_before_retry()),
+            ),
+        ),
+    })
 }
 
 async fn handle_delete_trace(
@@ -3438,3 +3641,7 @@ mod route_pad_to_pad_tests {
         assert!(tracks.lock().unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "via_mutation_tests.rs"]
+mod via_mutation_tests;
