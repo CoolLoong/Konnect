@@ -210,8 +210,8 @@ async fn handle_score_placement(
     // disk yet — the failure mode #595 was filed against. The saved file
     // remains the disclosed fallback for a closed or unreachable board;
     // scoring policy itself is unchanged either way.
-    let live = with_board_ipc_classified(ctx, &board, move |client, _| {
-        client.save_document_to_string()
+    let live = with_board_ipc_classified(ctx, &board, move |client, document| {
+        client.save_document_to_string_in(document)
     })
     .await?;
     let (content, source) = match live {
@@ -2131,6 +2131,88 @@ mod tests {
         assert_eq!(response["source"], "ipc");
         assert_eq!(response["footprints_scored"], 8, "{response}");
         assert_eq!(response["score"], 70, "{response}");
+    }
+
+    /// #690: the binding step already resolved the board, so serializing it
+    /// must address that document rather than ask KiCad which board is open
+    /// a second time.
+    #[tokio::test]
+    async fn a_live_score_asks_which_board_once_and_serializes_that_document() {
+        use konnect_ipc::gen::kiapi;
+        use prost::Message;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108) (generator konnect))").unwrap();
+        let live = std::fs::read_to_string(FIXTURE).unwrap();
+        let resolved =
+            crate::tools::pcb_board::board_mock::board_document(&board.to_string_lossy());
+
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let saved = Arc::new(Mutex::new(Vec::new()));
+        let server = crate::test_support::MockIpcServer::spawn("counting-lookups", {
+            let (lookups, saved, resolved) = (lookups.clone(), saved.clone(), resolved.clone());
+            move |request| {
+                let command = request.message.expect("a command");
+                let body = if command.type_url.ends_with("GetOpenDocuments") {
+                    lookups.fetch_add(1, Ordering::Relaxed);
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetOpenDocumentsResponse {
+                            documents: vec![resolved.clone()],
+                        },
+                        "kiapi.common.commands.GetOpenDocumentsResponse",
+                    ))
+                } else if command.type_url.ends_with("SaveDocumentToString") {
+                    let request = kiapi::common::commands::SaveDocumentToString::decode(
+                        command.value.as_slice(),
+                    )
+                    .unwrap();
+                    saved.lock().unwrap().push(request.document);
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::SavedDocumentResponse {
+                            contents: live.clone(),
+                            document: None,
+                        },
+                        "kiapi.common.commands.SavedDocumentResponse",
+                    ))
+                } else {
+                    None
+                };
+                kiapi::common::ApiResponse {
+                    status: Some(kiapi::common::ApiResponseStatus {
+                        status: kiapi::common::ApiStatusCode::AsOk as i32,
+                        error_message: String::new(),
+                    }),
+                    header: None,
+                    message: body,
+                }
+            }
+        });
+        let ctx = crate::tools::pcb_board::board_mock::ctx_talking_to(server.address().to_string());
+
+        let result = handle_score_placement(&json!({ "board": board.to_string_lossy() }), &ctx)
+            .await
+            .unwrap();
+        assert!(!result.is_error, "score_placement errored: {result:?}");
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("expected text content");
+        };
+        let response: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(response["source"], "ipc", "{response}");
+        assert_eq!(response["score"], 70, "{response}");
+
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            1,
+            "the serialization reuses the document the binding step resolved"
+        );
+        assert_eq!(
+            *saved.lock().unwrap(),
+            [Some(resolved)],
+            "the one SaveDocumentToString names the document GetOpenDocuments returned"
+        );
     }
 
     /// #595's exact reported failure mode, reproduced directly: the saved
