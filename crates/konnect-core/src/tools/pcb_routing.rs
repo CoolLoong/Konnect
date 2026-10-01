@@ -11,6 +11,7 @@ use crate::tools::{
     get_path, opt_f64, require_f64, require_str, with_board_ipc_classified,
     with_bound_board_ipc_classified, BoardBinding, ToolContext, ToolDef,
 };
+use crate::tools::{invalid_arg, opt_positive_f64};
 use anyhow::Context;
 use konnect_sexp::writer::{apply_edits, write_atomic, write_atomic_if_unchanged, SexpEdit};
 use prost::Message;
@@ -479,7 +480,13 @@ async fn handle_route_trace(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let width = args["width"].as_f64().unwrap_or(0.25);
+    let width = match opt_positive_f64(args, "width") {
+        Ok(value) => value.unwrap_or(0.25),
+        Err(error) => return Ok(error),
+    };
+    if let Err(error) = konnect_ipc::builders::validate_track_geometry(width, &[(x1, y1, x2, y2)]) {
+        return Ok(invalid_arg("geometry", &error.to_string()));
+    }
 
     let net_ipc = net_name.clone();
     let layer_ipc = layer.clone();
@@ -1472,7 +1479,13 @@ async fn handle_modify_trace(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
-    let width = args["width"].as_f64().unwrap_or(0.25);
+    let width = match opt_positive_f64(args, "width") {
+        Ok(value) => value.unwrap_or(0.25),
+        Err(error) => return Ok(error),
+    };
+    if let Err(error) = konnect_ipc::builders::validate_track_geometry(width, &[(x1, y1, x2, y2)]) {
+        return Ok(invalid_arg("geometry", &error.to_string()));
+    }
 
     let uuid_ipc = uuid.clone();
     let net_ipc = net_name.clone();
@@ -2327,6 +2340,37 @@ mod add_net_format_tests {
             },
             Arc::new(ToolRouter::new()),
         )
+    }
+
+    #[tokio::test]
+    async fn route_and_modify_refuse_invalid_geometry_before_board_access() {
+        for (key, value) in [
+            ("x1", json!(1e100)),
+            ("y2", json!(-1e100)),
+            ("width", json!(0.00000049)),
+            ("width", json!(0)),
+            ("width", json!("bad")),
+        ] {
+            let mut args = json!({"board":"/unavailable.kicad_pcb", "uuid":"existing-trace",
+                "net_name":"NET", "layer":"F.Cu", "width":0.25,
+                "x1":15.9, "y1":8.2, "x2":16.0, "y2":8.2});
+            args[key] = value;
+            for result in [
+                handle_route_trace(&args, &test_ctx()).await.unwrap(),
+                handle_modify_trace(&args, &test_ctx()).await.unwrap(),
+            ] {
+                assert!(result.is_error);
+                let text = text_of(&result);
+                assert!(
+                    text.contains("geometry") || text.contains("width"),
+                    "{text}"
+                );
+                assert!(
+                    !text.contains("unavailable.kicad_pcb"),
+                    "board accessed before validation: {text}"
+                );
+            }
+        }
     }
 
     /// Runs add_net against a throwaway copy of `board` and returns the

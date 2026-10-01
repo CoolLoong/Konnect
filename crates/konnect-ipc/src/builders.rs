@@ -5,9 +5,38 @@
 
 use crate::gen::kiapi;
 
-/// Converts millimeters to KiCAD nanometers.
+/// Converts validated millimeters to nearest KiCAD nanometers. Half-nanometer
+/// ties round away from zero. Use [`try_mm_to_nm`] for untrusted coordinates.
 pub fn mm_to_nm(mm: f64) -> i64 {
-    (mm * 1_000_000.0) as i64
+    (mm * 1_000_000.0).round() as i64
+}
+
+/// Checked conversion: never permit NaN, infinity or a saturating integer cast.
+pub fn try_mm_to_nm(mm: f64) -> anyhow::Result<i64> {
+    let nm = (mm * 1_000_000.0).round();
+    // i64::MAX as f64 is 2^63, already outside i64; the upper bound is exclusive.
+    anyhow::ensure!(
+        mm.is_finite() && nm.is_finite() && nm >= i64::MIN as f64 && nm < -(i64::MIN as f64),
+        "millimeter value must be finite and representable in integer nanometers"
+    );
+    Ok(nm as i64)
+}
+
+/// Validate the complete route before looking up a net or changing any items.
+pub fn validate_track_geometry(
+    width: f64,
+    segments: &[(f64, f64, f64, f64)],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        try_mm_to_nm(width)? > 0,
+        "track width must round to positive nanometers"
+    );
+    for &(x1, y1, x2, y2) in segments {
+        for coordinate in [x1, y1, x2, y2] {
+            try_mm_to_nm(coordinate)?;
+        }
+    }
+    Ok(())
 }
 
 /// Converts KiCAD nanometers to millimeters.
@@ -699,6 +728,60 @@ pub fn board_text_with_stroke_width(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn nanometer_rounding_matches_decimal_grid_for_both_signs_and_ties() {
+        for (mm, nm) in [
+            (8.2, 8_200_000),
+            (15.9, 15_900_000),
+            (-8.2, -8_200_000),
+            (-15.9, -15_900_000),
+            (0.0000005, 1),
+            (-0.0000005, -1),
+            (0.00000049, 0),
+            (-0.00000049, 0),
+        ] {
+            assert_eq!(try_mm_to_nm(mm).unwrap(), nm);
+            assert_eq!(mm_to_nm(mm), nm);
+        }
+        let track = build_track("NET", 1, "F.Cu", 0.25, 15.9, 8.2, -15.9, -8.2);
+        assert_eq!(
+            track.start.unwrap(),
+            kiapi::common::types::Vector2 {
+                x_nm: 15_900_000,
+                y_nm: 8_200_000
+            }
+        );
+        assert_eq!(
+            track.end.unwrap(),
+            kiapi::common::types::Vector2 {
+                x_nm: -15_900_000,
+                y_nm: -8_200_000
+            }
+        );
+    }
+
+    #[test]
+    fn nanometer_conversion_refuses_nonfinite_and_integer_overflow() {
+        for mm in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+            -(i64::MIN as f64) / 1_000_000.0,
+            (i64::MIN as f64) / 1_000_000.0 - 1.0,
+        ] {
+            assert!(try_mm_to_nm(mm).is_err(), "{mm:?}");
+        }
+        assert_eq!(
+            try_mm_to_nm((i64::MIN as f64) / 1_000_000.0).unwrap(),
+            i64::MIN
+        );
+        assert!(try_mm_to_nm(-(i64::MIN as f64) / 1_000_000.0 - 1.0).is_ok());
+        assert!(validate_track_geometry(0.00000049, &[(0.0, 0.0, 1.0, 1.0)]).is_err());
+        assert!(validate_track_geometry(0.25, &[(0.0, 0.0, f64::NAN, 1.0)]).is_err());
+    }
     use kiapi::common::types::graphic_shape::Geometry;
 
     /// `layer_name` is the exact inverse of `layer_from_name` over every

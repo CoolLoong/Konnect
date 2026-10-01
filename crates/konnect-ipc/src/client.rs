@@ -2493,6 +2493,7 @@ impl KiCadIpcClient {
         width: f64,
         segments: &[(f64, f64, f64, f64)],
     ) -> Result<()> {
+        crate::builders::validate_track_geometry(width, segments)?;
         let net_code = self.resolve_net_code_in(document.clone(), net_name)?;
         let items = segments
             .iter()
