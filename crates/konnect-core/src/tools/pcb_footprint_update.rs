@@ -4344,6 +4344,24 @@ mod tests {
             }
         }
         #[test]
+        fn bom_ownership_is_preserved_for_schematic_and_refreshed_for_board_only() {
+            let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+            for board_only in [false, true] {
+                let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+                current.attributes.as_mut().unwrap().not_in_schematic = board_only;
+                let prepared =
+                    build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new())
+                        .unwrap();
+                let updated =
+                    kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
+                        .unwrap();
+                assert_eq!(
+                    updated.attributes.unwrap().exclude_from_bill_of_materials,
+                    !board_only
+                );
+            }
+        }
+        #[test]
         fn malformed_and_duplicate_properties_refuse_without_prepared_items() {
             for clause in [
                 "(unlocked maybe)",
