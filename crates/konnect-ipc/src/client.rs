@@ -2584,6 +2584,133 @@ impl KiCadIpcClient {
         })
     }
 
+    /// Read a complete, typed via set from one exact board. A missing payload,
+    /// wrong Any type, malformed via or duplicate identity is unavailable
+    /// evidence, never a successful empty set. The canonical wire check also
+    /// refuses fields this build cannot preserve when a via is moved.
+    pub fn via_snapshot_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        uuid: &str,
+    ) -> Result<Option<kiapi::board::types::Via>> {
+        let command = kiapi::common::commands::GetItems {
+            header: Some(header_for(document)),
+            types: vec![kiapi::common::types::KiCadObjectType::KotPcbVia as i32],
+        };
+        let payload = self
+            .send_command(&command, "kiapi.common.commands.GetItems")?
+            .context("KiCad returned no GetItems via response payload")?;
+        anyhow::ensure!(
+            crate::builders::any_is(&payload, "kiapi.common.commands.GetItemsResponse"),
+            "KiCad returned the wrong Any type for via retrieval: {}",
+            payload.type_url
+        );
+        let response = kiapi::common::commands::GetItemsResponse::decode(payload.value.as_slice())?;
+        ensure_item_request_ok(response.status, "via retrieval")?;
+        let mut identities = std::collections::HashSet::new();
+        let mut found = None;
+        for item in response.items {
+            anyhow::ensure!(
+                crate::builders::any_is(&item, "kiapi.board.types.Via"),
+                "via retrieval returned an unexpected Any type: {}",
+                item.type_url
+            );
+            let via = kiapi::board::types::Via::decode(item.value.as_slice())
+                .context("KiCad returned malformed Via evidence")?;
+            let id = via
+                .id
+                .as_ref()
+                .map(|id| id.value.as_str())
+                .filter(|id| !id.is_empty())
+                .context("via evidence has no UUID")?;
+            anyhow::ensure!(
+                identities.insert(id.to_string()),
+                "duplicate via UUID '{id}'"
+            );
+            if id == uuid {
+                anyhow::ensure!(
+                    via.position.is_some() && via.pad_stack.is_some() && via.net.is_some(),
+                    "via '{uuid}' has incomplete position, pad stack or net evidence"
+                );
+                anyhow::ensure!(via.encode_to_vec() == item.value,
+                    "via '{uuid}' has noncanonical or unmodeled protobuf fields; cannot prove lossless preservation");
+                found = Some(via);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Delete only an observed Via, preserving delete_trace's narrower contract.
+    /// The caller supplies the bound document; all reads and writes use it.
+    /// Does not save the board. A write acknowledgement alone is never success.
+    pub fn delete_via_verified_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        uuid: &str,
+    ) -> Result<crate::types::IpcViaMutationOutcome> {
+        use crate::types::IpcViaMutationOutcome::{Applied, Missing, Uncertain};
+        let Some(before) = self.via_snapshot_in(document.clone(), uuid)? else {
+            return Ok(Missing);
+        };
+        // From this boundary on, even a timeout may mean KiCad applied the write.
+        let mutation = self.delete_items_in(document.clone(), vec![uuid.to_string()]);
+        let readback = self.via_snapshot_in(document, uuid);
+        match (mutation, readback) {
+            (Ok(()), Ok(None)) => Ok(Applied {
+                before: Box::new(before),
+                after: None,
+                changed: true,
+            }),
+            (mutation, readback) => Ok(Uncertain {
+                before: Box::new(before),
+                reason: format!(
+                    "delete_via '{uuid}': write={mutation:?}; independent readback={readback:?}"
+                ),
+            }),
+        }
+    }
+
+    /// Move one observed via by cloning its complete typed preimage and changing
+    /// only its position. Compare the entire independently read Via message,
+    /// including UUID, net, drill, layer pair, all pad sizes and lock state.
+    /// The nanometre position is already range checked by the caller.
+    pub fn move_via_verified_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        uuid: &str,
+        position: kiapi::common::types::Vector2,
+    ) -> Result<crate::types::IpcViaMutationOutcome> {
+        use crate::types::IpcViaMutationOutcome::{Applied, Missing, Uncertain};
+        let Some(before) = self.via_snapshot_in(document.clone(), uuid)? else {
+            return Ok(Missing);
+        };
+        let mut expected = before.clone();
+        expected.position = Some(position);
+        let changed = expected != before;
+        let mutation = if changed {
+            self.update_items_in(
+                document.clone(),
+                vec![crate::builders::pack_any(
+                    &expected,
+                    "kiapi.board.types.Via",
+                )],
+            )
+        } else {
+            Ok(())
+        };
+        let readback = self.via_snapshot_in(document, uuid);
+        match (mutation, readback) {
+            (Ok(()), Ok(Some(after))) if after == expected => Ok(Applied {
+                before: Box::new(before), after: Some(Box::new(after)), changed,
+            }),
+            (mutation, readback) if changed => Ok(Uncertain {
+                before: Box::new(before),
+                reason: format!("move_via '{uuid}': write={mutation:?}; expected={expected:?}; independent readback={readback:?}"),
+            }),
+            (_, readback) => anyhow::bail!("move_via no-op could not be confirmed; no write attempted: {readback:?}"),
+        }
+    }
+
     /// Delete one observed trace segment from the requested board.
     ///
     /// `DeleteItems` accepts any board-item KIID, so the item must first be

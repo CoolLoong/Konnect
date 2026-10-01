@@ -1,6 +1,22 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Verified single-via operation. Errors returned outside this enum precede
+/// the write; every error after attempting it is an uncertain outcome.
+#[derive(Debug)]
+pub enum IpcViaMutationOutcome {
+    Missing,
+    Applied {
+        before: Box<crate::gen::kiapi::board::types::Via>,
+        after: Option<Box<crate::gen::kiapi::board::types::Via>>,
+        changed: bool,
+    },
+    Uncertain {
+        before: Box<crate::gen::kiapi::board::types::Via>,
+        reason: String,
+    },
+}
+
 /// KiCad design editor addressed by the typed IPC API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
