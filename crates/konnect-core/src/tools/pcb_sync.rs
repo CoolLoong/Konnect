@@ -1908,16 +1908,11 @@ fn snapshot_board(client: &konnect_ipc::KiCadIpcClient, board: &Path) -> Result<
             record_routed_net(&mut routed_nets, via.net.as_ref());
         }
     }
-    if !client
-        .get_items_in(document.clone(), ObjectType::KotPcbZone)?
-        .is_empty()
-    {
-        // KiCad 10's Zone protobuf does not expose the zone net. A pad-net
-        // reassignment on a zoned board therefore fails closed.
-        for net in net_codes.keys() {
-            *routed_nets.entry(net.clone()).or_insert(0) += 1;
-        }
-    }
+    record_zone_nets(
+        &mut routed_nets,
+        &client.get_items_in(document.clone(), ObjectType::KotPcbZone)?,
+        &net_codes,
+    )?;
     let extents = client
         .get_optional_board_extents_in(document.clone())?
         .unwrap_or(konnect_ipc::IpcBoardExtents {
@@ -2092,6 +2087,62 @@ fn record_routed_net(
     if let Some(net) = net.filter(|net| !net.name.is_empty()) {
         *routed.entry(net.name.clone()).or_insert(0) += 1;
     }
+}
+
+/// Zone's net is nested in CopperZoneSettings, not at the Zone root. Never
+/// infer netlessness from absent/unknown settings or silently skip bad items.
+fn record_zone_nets(
+    routed: &mut BTreeMap<String, usize>,
+    items: &[prost_types::Any],
+    net_codes: &BTreeMap<String, i32>,
+) -> Result<()> {
+    use konnect_ipc::gen::kiapi::board::types::{zone::Settings, Zone, ZoneType};
+    let mut seen = HashSet::new();
+    let mut observed = Vec::new();
+    for item in items {
+        anyhow::ensure!(
+            item.type_url == "type.googleapis.com/kiapi.board.types.Zone",
+            "unexpected zone message type"
+        );
+        let zone = Zone::decode(item.value.as_slice()).context("invalid live zone payload")?;
+        let id = zone
+            .id
+            .as_ref()
+            .filter(|id| !id.value.is_empty())
+            .context("live zone has no identity")?;
+        anyhow::ensure!(
+            seen.insert(id.value.clone()),
+            "duplicate live zone identity {}",
+            id.value
+        );
+        match (ZoneType::try_from(zone.r#type), &zone.settings) {
+            (Ok(ZoneType::ZtRuleArea), Some(Settings::RuleAreaSettings(_))) => {}
+            (Ok(ZoneType::ZtGraphical), Some(Settings::CopperSettings(settings))) => {
+                // A graphical zone cannot carry copper. Still require explicit
+                // net-zero evidence rather than accepting unknown settings.
+                let net = settings.net.as_ref().context("graphical zone has no net evidence")?;
+                anyhow::ensure!(net.name.is_empty() && net.code.as_ref().is_none_or(|code| code.value == 0), "graphical zone carries a net");
+            }
+            (Ok(ZoneType::ZtCopper | ZoneType::ZtTeardrop), Some(Settings::CopperSettings(settings))) => {
+                let net = settings.net.as_ref().with_context(|| format!("zone {} has no net evidence", id.value))?;
+                if net.name.is_empty() {
+                    anyhow::ensure!(net.code.as_ref().is_none_or(|code| code.value == 0), "zone has a nonzero code but no net name");
+                } else {
+                    let code = net_codes.get(&net.name).filter(|code| **code > 0).context("zone net is absent from the live net table")?;
+                    // Native KiCad 10 serializes the zone's net NAME only.
+                    // A supplied code is additional evidence and must agree.
+                    anyhow::ensure!(net.code.as_ref().is_none_or(|provided| provided.value == *code), "zone net name/code is inconsistent with the live net table: {}", net.name);
+                    observed.push(net.name.clone());
+                }
+            }
+            _ => bail!("zone {} has unknown or inconsistent type/settings; routed-net coverage is unavailable", id.value),
+        }
+    }
+    // Publish observations only after every zone is understood.
+    for name in observed {
+        *routed.entry(name).or_insert(0) += 1;
+    }
+    Ok(())
 }
 
 /// A library footprint the plan wants to place and Konnect could not prepare,
@@ -3497,6 +3548,156 @@ mod tests {
         let net_change = plan_sync("netlist", &design, &board_with(vec![footprint]));
         assert_eq!(net_change.status, PlanStatus::Ready);
         assert_eq!(net_change.counts.pads_reassigned.planned, 1);
+    }
+
+    #[test]
+    fn zoned_board_only_protects_actual_copper_nets_and_allows_unrouted_nc_change() {
+        use konnect_ipc::gen::kiapi::board::types::{zone::Settings, Zone};
+        let gnd = Zone::decode(
+            include_bytes!("../../tests/fixtures/issue_474_copper_zone_0.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        let Some(Settings::CopperSettings(settings)) = &gnd.settings else {
+            panic!("captured copper zone")
+        };
+        assert_eq!(settings.net.as_ref().unwrap().name, "GND");
+        assert!(
+            settings.net.as_ref().unwrap().code.is_none(),
+            "native capture has name-only net evidence"
+        );
+        let mut supply = gnd.clone();
+        supply.id.as_mut().unwrap().value.push_str("-supply");
+        let Some(Settings::CopperSettings(settings)) = &mut supply.settings else {
+            unreachable!()
+        };
+        settings.net.as_mut().unwrap().name = "VCC".into();
+        let zones = vec![
+            konnect_ipc::builders::pack_any(&gnd, "kiapi.board.types.Zone"),
+            konnect_ipc::builders::pack_any(&supply, "kiapi.board.types.Zone"),
+        ];
+        let nets = BTreeMap::from([
+            ("GND".into(), 1),
+            ("VCC".into(), 2),
+            ("OLD_NC".into(), 3),
+            ("NEW_SIGNAL".into(), 4),
+        ]);
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.pad_numbers.insert("3".into());
+        footprint.pad_nets.insert("3".into(), "OLD_NC".into());
+        let mut board = board_with(vec![footprint]);
+        record_zone_nets(&mut board.routed_nets, &zones, &nets).unwrap();
+        assert_eq!(
+            board.routed_nets,
+            BTreeMap::from([("GND".into(), 1), ("VCC".into(), 1)])
+        );
+        let mut component = resistor("R1", "/sheet/existing");
+        component.pad_nets.insert("3".into(), "NEW_SIGNAL".into());
+        let design = |component| ExportedDesign {
+            components: vec![component],
+            skipped: vec![],
+            unassigned: vec![],
+        };
+        let permitted = plan_sync("netlist", &design(component.clone()), &board);
+        assert_eq!(permitted.status, PlanStatus::Ready);
+        assert_eq!(permitted.counts.pads_reassigned.planned, 1);
+        for pad in ["1", "2"] {
+            let mut changed = component.clone();
+            changed.pad_nets.insert(pad.into(), "NEW_SIGNAL".into());
+            let denied = plan_sync("netlist", &design(changed), &board);
+            assert_eq!(denied.status, PlanStatus::Conflict);
+            assert!(denied.changes.is_empty());
+            assert!(denied
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "routed_pad_net_change"));
+        }
+    }
+
+    #[test]
+    fn zone_net_unknown_malformed_or_inconsistent_evidence_is_never_netless() {
+        use konnect_ipc::gen::kiapi::board::types::{zone::Settings, NetCode, Zone, ZoneType};
+        let captured = Zone::decode(
+            include_bytes!("../../tests/fixtures/issue_474_copper_zone_0.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        let nets = BTreeMap::from([("GND".into(), 1)]);
+        let mut cases = vec![];
+        let mut zone = captured.clone();
+        zone.settings = None;
+        cases.push(zone);
+        let mut zone = captured.clone();
+        zone.r#type = ZoneType::ZtUnknown as i32;
+        cases.push(zone);
+        let mut zone = captured.clone();
+        zone.id = None;
+        cases.push(zone);
+        let mut zone = captured.clone();
+        if let Some(Settings::CopperSettings(settings)) = &mut zone.settings {
+            settings.net = None;
+        }
+        cases.push(zone);
+        for name in ["", "UNKNOWN"] {
+            let mut zone = captured.clone();
+            if let Some(Settings::CopperSettings(settings)) = &mut zone.settings {
+                let net = settings.net.as_mut().unwrap();
+                net.name = name.into();
+                net.code = Some(NetCode { value: 2 });
+            }
+            cases.push(zone);
+        }
+        let mut zone = captured.clone();
+        if let Some(Settings::CopperSettings(settings)) = &mut zone.settings {
+            settings.net.as_mut().unwrap().code = Some(NetCode { value: 2 });
+        }
+        cases.push(zone);
+        for mut zone in cases {
+            if let Some(id) = &mut zone.id {
+                id.value.push_str("-invalid");
+            }
+            let mut routed = BTreeMap::from([("existing track".into(), 1)]);
+            let before = routed.clone();
+            let items = vec![
+                konnect_ipc::builders::pack_any(&captured, "kiapi.board.types.Zone"),
+                konnect_ipc::builders::pack_any(&zone, "kiapi.board.types.Zone"),
+            ];
+            assert!(record_zone_nets(&mut routed, &items, &nets).is_err());
+            assert_eq!(
+                routed, before,
+                "unknown evidence cannot publish partial coverage"
+            );
+        }
+        let mut routed = BTreeMap::new();
+        let duplicate = konnect_ipc::builders::pack_any(&captured, "kiapi.board.types.Zone");
+        assert!(record_zone_nets(&mut routed, &[duplicate.clone(), duplicate], &nets).is_err());
+        assert!(record_zone_nets(
+            &mut routed,
+            &[prost_types::Any {
+                type_url: "type.googleapis.com/kiapi.board.types.Zone".into(),
+                value: vec![0xff]
+            }],
+            &nets
+        )
+        .is_err());
+        let mut netless = captured.clone();
+        if let Some(Settings::CopperSettings(settings)) = &mut netless.settings {
+            settings.net = Some(Default::default());
+        }
+        record_zone_nets(
+            &mut routed,
+            &[konnect_ipc::builders::pack_any(
+                &netless,
+                "kiapi.board.types.Zone",
+            )],
+            &nets,
+        )
+        .unwrap();
+        assert!(routed.is_empty());
+        let keepout = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.types.Zone".into(),
+            value: include_bytes!("../../tests/fixtures/issue_474_zone_0.ipc.bin").to_vec(),
+        };
+        record_zone_nets(&mut routed, &[keepout], &nets).unwrap();
+        assert!(routed.is_empty());
     }
 
     #[test]
