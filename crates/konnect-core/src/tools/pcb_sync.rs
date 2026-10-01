@@ -5436,16 +5436,34 @@ mod schematic_fields_tests {
         });
         let wanted = SchematicFields {
             exclude_from_bom: true,
-            fields: BTreeMap::from([("MPN".to_owned(), "MFR-42".to_owned())]),
+            fields: BTreeMap::from([
+                ("MPN".to_owned(), "MFR-42".to_owned()),
+                (
+                    "Datasheet".to_owned(),
+                    "https://example.test/instance.pdf".to_owned(),
+                ),
+                ("Description".to_owned(), "schematic annotation".to_owned()),
+            ]),
         };
         sync_schematic_fields(&mut before, &wanted).unwrap();
-        let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+        let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod")
+            .replace("KiLib_Generator", "MPN");
+        // A same-name library default must not overwrite synchronized MPN.
+        let original_datasheet = before.datasheet_field.clone();
+        let original_description = before.description_field.clone();
         let after =
-            crate::tools::pcb_footprint_update::refresh_for_integration_test(&before, source)
+            crate::tools::pcb_footprint_update::refresh_for_integration_test(&before, &source)
                 .unwrap();
         let observed = read_schematic_fields(&after).unwrap();
         assert!(observed.exclude_from_bom);
         assert_eq!(observed.fields["MPN"], "MFR-42");
+        assert_eq!(
+            observed.fields["Datasheet"],
+            "https://example.test/instance.pdf"
+        );
+        assert_eq!(observed.fields["Description"], "schematic annotation");
+        assert_eq!(after.datasheet_field, original_datasheet);
+        assert_eq!(after.description_field, original_description);
         assert_eq!(after.id, before.id);
         assert_eq!(after.symbol_path, before.symbol_path);
         assert_eq!(after.position, before.position);
