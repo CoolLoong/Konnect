@@ -5428,6 +5428,12 @@ mod schematic_fields_tests {
     #[test]
     fn library_refresh_after_schematic_sync_keeps_mpn_bom_and_native_identity() {
         let mut before = captured_footprint();
+        // Controlled identity variant of the captured instance, matching the
+        // stock KiCad-authored library definition used by this combined test.
+        before.definition.as_mut().unwrap().id = Some(kiapi::common::types::LibraryIdentifier {
+            library_nickname: "Capacitor_SMD".to_owned(),
+            entry_name: "C_0603_1608Metric".to_owned(),
+        });
         let wanted = SchematicFields {
             exclude_from_bom: true,
             fields: BTreeMap::from([("MPN".to_owned(), "MFR-42".to_owned())]),
