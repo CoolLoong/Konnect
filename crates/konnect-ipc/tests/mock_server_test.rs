@@ -17,6 +17,8 @@ use prost::Message;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod common;
+
 /// A rep0 server answering each request via `respond`.
 /// Returns the inproc:// URL to dial. The server thread exits when the socket
 /// errors (i.e. when `_socket_keepalive` is dropped by the returned guard).
@@ -2884,6 +2886,163 @@ mod layer_name_budget {
         assert!(
             elapsed < Duration::from_secs(4),
             "the loop took {elapsed:?}: the second lookup waited past the budget"
+        );
+    }
+}
+
+/// `get_board_stackup_in` (#716): one `GetBoardStackup` naming the document
+/// it was given, and a refusal for an answer it cannot read rather than an
+/// empty stackup.
+mod board_stackup {
+    use super::*;
+
+    fn stackup_response() -> prost_types::Any {
+        builders::pack_any(
+            &kiapi::board::commands::BoardStackupResponse {
+                stackup: Some(kiapi::board::BoardStackup {
+                    finish: Some(kiapi::board::BoardFinish {
+                        type_name: "None".to_string(),
+                    }),
+                    layers: vec![kiapi::board::BoardStackupLayer {
+                        thickness: Some(kiapi::common::types::Distance { value_nm: 35_000 }),
+                        layer: kiapi::board::types::BoardLayer::BlFCu as i32,
+                        enabled: true,
+                        r#type: kiapi::board::BoardStackupLayerType::BsltCopper as i32,
+                        material_name: "copper".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            },
+            "kiapi.board.commands.BoardStackupResponse",
+        )
+    }
+
+    #[test]
+    fn the_request_names_the_document_and_the_answer_is_decoded() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let server = spawn_mock(move |request| {
+            let command = request.message.expect("a command");
+            if command.type_url.ends_with("GetBoardStackup") {
+                let get = kiapi::board::commands::GetBoardStackup::decode(command.value.as_slice())
+                    .unwrap();
+                seen.lock().unwrap().push(get.board);
+                return Some(reply_with(stackup_response()));
+            }
+            Some(ok_response())
+        });
+        let client = KiCadIpcClient::new(&server.url);
+
+        let stackup = client
+            .get_board_stackup_in(doc_for("stack.kicad_pcb"))
+            .expect("KiCad answered");
+
+        assert_eq!(*asked.lock().unwrap(), [Some(doc_for("stack.kicad_pcb"))]);
+        assert_eq!(stackup.finish, "None");
+        assert_eq!(stackup.layers.len(), 1);
+        assert_eq!(stackup.layers[0].layer.as_deref(), Some("F.Cu"));
+        assert_eq!(stackup.layers[0].thickness_nm, 35_000);
+    }
+
+    /// KiCad 10.0.6's own answer for `four_layer_stackup_kicad10.kicad_pcb`,
+    /// captured unchanged, decodes to the stackup that board's file declares.
+    /// The board and the capture are both KiCad's output; the fixture's README
+    /// says how each was made.
+    #[test]
+    fn kicads_captured_answer_is_the_stackup_its_board_file_declares() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let captured = prost_types::Any {
+            type_url: "type.googleapis.com/kiapi.board.commands.BoardStackupResponse".to_string(),
+            value: include_bytes!("fixtures/four_layer_stackup_kicad10.ipc.bin").to_vec(),
+        };
+        let server = spawn_mock(move |request| {
+            let command = request.message.expect("a command");
+            if command.type_url.ends_with("GetBoardStackup") {
+                return Some(reply_with(captured.clone()));
+            }
+            Some(ok_response())
+        });
+        let client = KiCadIpcClient::new(&server.url);
+
+        let stackup = client
+            .get_board_stackup_in(doc_for("four_layer_stackup_kicad10.kicad_pcb"))
+            .expect("KiCad answered");
+
+        common::assert_matches_file(
+            &stackup,
+            &fixtures.join("four_layer_stackup_kicad10.kicad_pcb"),
+        );
+        // What this board has that `live_ipc`'s two-layer stackup does not,
+        // so a fixture that lost them would say so here.
+        let kinds: Vec<_> = stackup
+            .layers
+            .iter()
+            .filter_map(|l| l.dielectric_type.as_deref())
+            .collect();
+        assert_eq!(kinds, ["prepreg", "core", "prepreg"]);
+        assert_eq!(
+            stackup.layers.iter().filter(|l| l.kind == "copper").count(),
+            4
+        );
+        assert_eq!(stackup.finish, "ENIG");
+        assert!(stackup.impedance_controlled);
+        assert_eq!(stackup.edge_connector, "beveled");
+        assert!(stackup.has_edge_plating);
+    }
+
+    #[test]
+    fn an_answer_with_no_body_is_refused_not_read_as_an_empty_stackup() {
+        let server = spawn_mock(|_| Some(ok_response()));
+        let client = KiCadIpcClient::new(&server.url);
+
+        let error = client
+            .get_board_stackup_in(doc_for("stack.kicad_pcb"))
+            .expect_err("no body is no answer");
+
+        assert!(
+            format!("{error:#}").contains("returned no stackup"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn an_answer_of_another_type_is_refused() {
+        let server = spawn_mock(|_| {
+            Some(reply_with(builders::pack_any(
+                &kiapi::board::commands::BoardEnabledLayersResponse::default(),
+                "kiapi.board.commands.BoardEnabledLayersResponse",
+            )))
+        });
+        let client = KiCadIpcClient::new(&server.url);
+
+        let error = client
+            .get_board_stackup_in(doc_for("stack.kicad_pcb"))
+            .expect_err("a different message is not a stackup");
+
+        assert!(
+            format!("{error:#}").contains("not a BoardStackupResponse"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_response_carrying_no_stackup_is_refused_not_read_as_an_empty_one() {
+        let server = spawn_mock(|_| {
+            Some(reply_with(builders::pack_any(
+                &kiapi::board::commands::BoardStackupResponse { stackup: None },
+                "kiapi.board.commands.BoardStackupResponse",
+            )))
+        });
+        let client = KiCadIpcClient::new(&server.url);
+
+        let error = client
+            .get_board_stackup_in(doc_for("stack.kicad_pcb"))
+            .expect_err("a response with no stackup is no answer");
+
+        assert!(
+            format!("{error:#}").contains("carries no stackup"),
+            "{error:#}"
         );
     }
 }

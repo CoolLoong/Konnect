@@ -544,6 +544,66 @@ pub struct IpcEnabledLayers {
     pub layers: Vec<IpcLayer>,
 }
 
+/// A board's physical stackup, as KiCad's `GetBoardStackup` serves it.
+///
+/// KiCad answers with the board's own stackup, or with its default one when
+/// the board defines none (`BOARD::GetStackupOrDefault`), and the message does
+/// not say which. Values KiCad marks "Not specified" are kept as it sends them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcBoardStackup {
+    /// The copper finish KiCad names, e.g. "ENIG"; empty or "Not specified"
+    /// when the board names none.
+    pub finish: String,
+    pub impedance_controlled: bool,
+    /// "none", "plain", "beveled" or "unknown".
+    pub edge_connector: String,
+    pub has_edge_plating: bool,
+    /// Top to bottom, in KiCad's order.
+    pub layers: Vec<IpcStackupLayer>,
+}
+
+/// One entry of a physical stackup.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcStackupLayer {
+    /// KiCad's canonical layer name, e.g. "F.Cu" or "F.Mask". `None` for a
+    /// dielectric, which is not a board layer of its own.
+    pub layer: Option<String>,
+    /// The name the board gives the layer, when KiCad reports one.
+    pub user_name: Option<String>,
+    /// "copper", "dielectric", "soldermask", "silkscreen", "solderpaste" or
+    /// "undefined".
+    pub kind: String,
+    pub enabled: bool,
+    /// The entry's thickness in nanometres. A dielectric's own value is its
+    /// first sub-layer's; `dielectric` carries every sub-layer.
+    pub thickness_nm: i64,
+    /// Empty when KiCad reports none. A dielectric's materials are per
+    /// sub-layer, in `dielectric`.
+    pub material: String,
+    /// `#RRGGBBAA`, only when the board specifies a color.
+    pub color: Option<String>,
+    /// "core", "prepreg", "none", or "unknown" for a value this crate does not
+    /// know, for a dielectric.
+    pub dielectric_type: Option<String>,
+    /// A dielectric's physical sub-layers, top to bottom.
+    pub dielectric: Vec<IpcStackupDielectric>,
+    /// A solder mask's relative permittivity.
+    pub epsilon_r: Option<f64>,
+    /// A solder mask's loss tangent.
+    pub loss_tangent: Option<f64>,
+}
+
+/// One physical sub-layer of a dielectric slot. A slot between two copper
+/// layers can be built from several.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcStackupDielectric {
+    pub thickness_nm: i64,
+    pub material: String,
+    pub epsilon_r: f64,
+    pub loss_tangent: f64,
+    pub thickness_locked: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcBoardExtents {
     pub min: IpcVector2,

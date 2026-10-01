@@ -60,6 +60,8 @@ use konnect_ipc::types::{
 use konnect_sexp::{parse_sexp, SexpNode};
 use std::path::Path;
 
+mod common;
+
 /// Where `adding_a_via_actually_creates_it_on_the_board` puts its via, and the
 /// outline `adding_a_zone_creates_it_on_the_live_board` pours. Both are
 /// absolute board coordinates, and both are checked against the fixture's
@@ -1008,6 +1010,54 @@ fn adding_a_zone_creates_it_on_the_live_board() {
         read_back().is_empty(),
         "the test zone survived its own cleanup"
     );
+}
+
+/// KiCad's stackup for the open board is the one its file declares (#716).
+///
+/// The expectation is the board's own `(setup (stackup …))` block
+/// (`common/mod.rs`). Observe-only, so it is safe against a tracked
+/// fixture: `live_ipc.kicad_pcb` declares a two-layer stackup, and
+/// `four_layer_stackup_kicad10.kicad_pcb` a four-layer fabrication stackup.
+///
+/// With the second open, `KONNECT_CAPTURE_IPC_FIXTURE` also writes KiCad's
+/// answer, unchanged, as that fixture's `.ipc.bin`. See the fixture's README.
+#[test]
+#[ignore = "requires a running KiCad GUI with its IPC API enabled"]
+fn the_live_stackup_is_the_one_the_board_file_declares() {
+    const CAPTURED_BOARD: &str = "four_layer_stackup_kicad10.kicad_pcb";
+
+    let board = std::env::var("KONNECT_LIVE_KICAD_BOARD")
+        .expect("KONNECT_LIVE_KICAD_BOARD must name the open board");
+    let socket = std::env::var("KICAD_API_SOCKET").expect("KICAD_API_SOCKET is required");
+    let client = KiCadIpcClient::new(socket);
+    let document = client
+        .find_open_board(Path::new(&board))
+        .expect("KiCad has not got the requested board open");
+
+    // Regeneration of the checked-in capture. Off by default.
+    if std::env::var("KONNECT_CAPTURE_IPC_FIXTURE").is_ok() {
+        if board.ends_with(CAPTURED_BOARD) {
+            let answer = client
+                .get_board_stackup_response_in(document.clone())
+                .expect("the stackup read failed");
+            let out = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/four_layer_stackup_kicad10.ipc.bin");
+            std::fs::write(&out, &answer.value).expect("failed to write capture");
+            eprintln!(
+                "wrote {} bytes of {} to {}",
+                answer.value.len(),
+                answer.type_url,
+                out.display()
+            );
+        } else {
+            eprintln!("no stackup capture: the capture is of {CAPTURED_BOARD}, not {board}");
+        }
+    }
+
+    let stackup = client
+        .get_board_stackup_in(document)
+        .expect("the stackup read failed");
+    common::assert_matches_file(&stackup, Path::new(&board));
 }
 
 /// The bundled fixture's own preconditions, checked without KiCad — and

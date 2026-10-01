@@ -1272,6 +1272,7 @@ pub fn tools() -> Vec<ToolDef> {
             |args, ctx| async move { handle_import_svg_logo(args, ctx).await }
         )
         .with_board_access(crate::tools::BoardAccess::LivePreferredWithFallback),
+        super::board_stackup::tool(),
     ]
 }
 
