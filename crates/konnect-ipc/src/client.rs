@@ -4443,13 +4443,24 @@ fn build_graphic_child(
             filled,
         } => {
             let (cx, cy) = xf(*center);
-            // The radius is rotation-invariant; keep KiCAD's center +
-            // circumference-point encoding by re-deriving it from the length.
+            // The circumference control point is persisted geometry. Replacing
+            // it with center+(radius,0) draws the same circle but loses library
+            // identity: KiCad's DRC compares the original radius point too.
             let radius = ((end.0 - center.0).powi(2) + (end.1 - center.1).powi(2)).sqrt();
-            builders::pack_any(
-                &builders::board_circle(layer, *width, cx, cy, radius, *filled),
-                SHAPE,
-            )
+            let mut shape = builders::board_circle(layer, *width, cx, cy, radius, *filled);
+            let geometry = shape
+                .shape
+                .as_mut()
+                .expect("circle shape")
+                .geometry
+                .as_mut()
+                .expect("circle geometry");
+            let kiapi::common::types::graphic_shape::Geometry::Circle(circle) = geometry else {
+                unreachable!("board_circle always builds circle geometry")
+            };
+            let (ex, ey) = xf(*end);
+            circle.radius_point = Some(builders::vec2(ex, ey));
+            builders::pack_any(&shape, SHAPE)
         }
         IpcGraphicDefinition::Arc {
             start,
@@ -5613,7 +5624,7 @@ mod footprint_graphics_tests {
     /// A circle's radius survives rotation via the circumference-point
     /// encoding.
     #[test]
-    fn circle_center_rotates_and_radius_is_preserved() {
+    fn circle_center_and_library_radius_point_rotate_without_canonicalizing() {
         let graphics = vec![IpcGraphicDefinition::Circle {
             center: (1.0, 0.0),
             end: (1.5, 0.0),
@@ -5630,11 +5641,44 @@ mod footprint_graphics_tests {
         // Center (1,0) at 90° around (10,10): (10, 9).
         assert_eq!(c.center.unwrap().x_nm, 10_000_000);
         assert_eq!(c.center.unwrap().y_nm, 9_000_000);
-        // Radius 0.5 mm regardless of rotation.
-        assert_eq!(
-            c.radius_point.unwrap().x_nm - c.center.unwrap().x_nm,
-            500_000
-        );
+        // The original endpoint (1.5,0) rotates with the center: (10,8.5).
+        assert_eq!(c.radius_point.unwrap().x_nm, 10_000_000);
+        assert_eq!(c.radius_point.unwrap().y_nm, 8_500_000);
+    }
+
+    #[test]
+    fn testpoint_circle_radius_point_survives_front_back_and_rotation_inputs() {
+        for (end, layer, rotation, expected) in [
+            ((0.0, 0.7), "F.SilkS", 0.0, (10_000_000, 10_700_000)),
+            ((0.0, -0.7), "B.SilkS", 0.0, (10_000_000, 9_300_000)),
+            ((0.0, 0.7), "F.SilkS", 90.0, (10_700_000, 10_000_000)),
+            ((0.0, -0.7), "B.SilkS", 90.0, (9_300_000, 10_000_000)),
+            ((-0.3, 0.4), "F.SilkS", 0.0, (9_700_000, 10_400_000)),
+        ] {
+            let fp = build(
+                &[IpcGraphicDefinition::Circle {
+                    center: (0.0, 0.0),
+                    end,
+                    layer: layer.into(),
+                    width: 0.12,
+                    filled: false,
+                }],
+                10.0,
+                10.0,
+                rotation,
+            );
+            let shape = shapes(&fp).remove(0);
+            assert_eq!(shape.layer, crate::builders::layer_from_name(layer) as i32);
+            let kiapi::common::types::graphic_shape::Geometry::Circle(circle) =
+                shape.shape.unwrap().geometry.unwrap()
+            else {
+                panic!("circle");
+            };
+            let point = circle.radius_point.unwrap();
+            assert_eq!((point.x_nm, point.y_nm), expected);
+            let center = circle.center.unwrap();
+            assert_eq!((center.x_nm, center.y_nm), (10_000_000, 10_000_000));
+        }
     }
 
     /// #117 guard for the pad path: the same PST_NORMAL rule that broke
