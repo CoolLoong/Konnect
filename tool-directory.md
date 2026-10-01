@@ -240,6 +240,7 @@ and Windows servers do not.
 
 | Tool | Description |
 |------|-------------|
+| `batch_flip_components` | Preview and revision-checked native F.Cu/B.Cu footprint batches; one undo commit, pad identities/nets preserved, independent complete-board readback, no auto-save or file fallback. |
 | `edit_footprint_field_layout` | Preview and revision-checked batch edit of placed Reference/Value absolute positions, angles, text sizes and visibility; one native undo commit and independent complete-board readback. |
 | `set_board_size` | Add a rectangular board outline of the given dimensions on the Edge.Cuts layer. Appends — clear the old edges with `delete_graphics` first. |
 | `get_board_info` | Return metadata about the PCB: title, revision, company, paper size (with `paper_size_mm` dimensions on a custom User size), `layer_count`, `copper_layer_count`, and `net_count` (IPC, falls back to a file parse that counts from the tree, so KiCad 10 boards report real numbers instead of 0). |
