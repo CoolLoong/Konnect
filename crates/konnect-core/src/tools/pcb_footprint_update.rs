@@ -1027,6 +1027,14 @@ fn parse_library_property(
     let mut identifier = None;
 
     for clause in property.children().unwrap_or_default().iter().skip(3) {
+        // KiCad's legacy bare `hide` is equivalent to `(hide yes)`.
+        // Recognize only that atom; other atoms must remain explicit refusals.
+        if clause.as_str() == Some("hide") {
+            if hidden.replace(true).is_some() {
+                bail!("property '{name}' contains duplicate 'hide' clauses");
+            }
+            continue;
+        }
         let tag = clause
             .head()
             .with_context(|| format!("property '{name}' contains an unsupported atom"))?;
@@ -4432,6 +4440,86 @@ mod tests {
                 capture.commit_actions,
                 vec![kiapi::common::commands::CommitAction::CmaCommit]
             );
+        }
+    }
+    mod legacy_hide_regressions {
+        use super::*;
+
+        #[test]
+        fn legacy_bare_hide_has_the_same_typed_meaning_as_explicit_hide_yes() {
+            let source = KICAD_LIBRARY_FOOTPRINT.replace("(hide yes)", "hide");
+            assert_ne!(source, KICAD_LIBRARY_FOOTPRINT);
+            let modern = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+            let legacy = parse_library_footprint("Test:Socket", &source).unwrap();
+            assert_eq!(legacy.properties, modern.properties);
+            assert!(legacy.properties.iter().all(|f| !f.visible));
+        }
+
+        #[tokio::test]
+        async fn served_legacy_hide_apply_preserves_source_and_ambiguous_hide_never_writes() {
+            for ambiguous in [false, true] {
+                let (_tmp, board, items) = plan_fixture();
+                let source = KICAD_LIBRARY_FOOTPRINT.replace(
+                    "(hide yes)",
+                    if ambiguous { "hide (hide no)" } else { "hide" },
+                );
+                let path = board.parent().unwrap().join("Test.pretty/Socket.kicad_mod");
+                std::fs::write(&path, &source).unwrap();
+                let mock = spawn_planner_mock(&board, items[0].clone(), false);
+                let mut config = test_context(&mock.url).config;
+                config.eager_toolsets = true;
+                let handler = crate::mcp::handler::McpHandler::new(config).await.unwrap();
+                let dry_request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_footprints_from_library","arguments":{"board":board}}});
+                let dry = handler
+                    .handle_message(dry_request)
+                    .await
+                    .unwrap()
+                    .result
+                    .unwrap();
+                let body: serde_json::Value =
+                    serde_json::from_str(dry["content"][0]["text"].as_str().unwrap()).unwrap();
+                if ambiguous {
+                    assert_eq!(body["status"], "conflict");
+                    assert_eq!(mock.capture.lock().unwrap().begin_count, 0);
+                    assert!(mock.capture.lock().unwrap().update_batches.is_empty());
+                } else {
+                    assert_eq!(body["status"], "ready");
+                    let request = json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"update_footprints_from_library","arguments":{"board":board,"dry_run":false,"expected_plan_revision":body["plan_revision"]}}});
+                    let result = handler
+                        .handle_message(request.clone())
+                        .await
+                        .unwrap()
+                        .result
+                        .unwrap();
+                    let body: serde_json::Value =
+                        serde_json::from_str(result["content"][0]["text"].as_str().unwrap())
+                            .unwrap();
+                    assert_eq!(body["status"], "applied");
+                    assert_eq!(mock.capture.lock().unwrap().update_batches, vec![1]);
+                    println!(
+                        "REGRESSION_MCP_HIDE_EVIDENCE {}",
+                        json!({"request":request,"response":body,"source":"served_dispatch_mock_ipc"})
+                    );
+                }
+                assert_eq!(std::fs::read_to_string(path).unwrap(), source);
+            }
+        }
+
+        #[test]
+        fn ambiguous_hide_and_unknown_atoms_still_refuse_before_planning_writes() {
+            for replacement in [
+                "hide (hide no)",
+                "(hide yes) hide",
+                "hide hide",
+                "unexpected_atom",
+            ] {
+                let source = KICAD_LIBRARY_FOOTPRINT.replacen("(hide yes)", replacement, 1);
+                assert_ne!(source, KICAD_LIBRARY_FOOTPRINT);
+                assert!(
+                    parse_library_footprint("Test:Socket", &source).is_err(),
+                    "must reject {replacement}"
+                );
+            }
         }
     }
 }
