@@ -1018,9 +1018,10 @@ fn verify_library_readback(
         let after = observed.get(id).with_context(|| {
             format!("updated footprint '{id}' missing from independent readback")
         })?;
+        let changed = changed_domains(&wanted, after)?;
         anyhow::ensure!(
-            changed_domains(&wanted, after)?.is_empty(),
-            "library-owned attributes differ after update of '{id}'"
+            changed.is_empty(),
+            "library-owned content differs after update of '{id}': {changed:?}"
         );
         let nets = wanted
             .definition
@@ -2409,6 +2410,15 @@ fn normalized_items(
                 pad.pad_to_die_delay = None;
                 if let Some(stack) = pad.pad_stack.as_mut() {
                     stack.layers.sort_unstable();
+                    // KiCad serializes equivalent signed pad angles in [0, 360).
+                    // Compare exact directions; do not round or tolerate geometry changes.
+                    if let Some(angle) = stack.angle.as_mut() {
+                        anyhow::ensure!(angle.value_degrees.is_finite(), "nonfinite pad angle");
+                        angle.value_degrees = angle.value_degrees.rem_euclid(360.0);
+                        if angle.value_degrees == 0.0 {
+                            angle.value_degrees = 0.0; // canonical positive zero
+                        }
+                    }
                     if stack.drill.as_ref().is_some_and(|drill| {
                         drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
                             && drill.end_layer
@@ -3880,6 +3890,258 @@ mod tests {
         assert_ne!(
             library_changed.plan_revision,
             different_filter.plan_revision
+        );
+    }
+
+    #[test]
+    fn actual_kicad_signed_pad_angle_roundtrip_is_equal_but_real_changes_differ() {
+        let prepared = kiapi::board::types::Pad::decode(
+            include_bytes!("../../tests/fixtures/ipc_library_pad_angle_prepared.bin").as_slice(),
+        )
+        .unwrap();
+        let observed = kiapi::board::types::Pad::decode(
+            include_bytes!("../../tests/fixtures/ipc_library_pad_angle_after.bin").as_slice(),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared
+                .pad_stack
+                .as_ref()
+                .unwrap()
+                .angle
+                .unwrap()
+                .value_degrees,
+            -90.0
+        );
+        assert_eq!(
+            observed
+                .pad_stack
+                .as_ref()
+                .unwrap()
+                .angle
+                .unwrap()
+                .value_degrees,
+            270.0
+        );
+        let norm = |pad: &kiapi::board::types::Pad| {
+            normalized_items(
+                &kiapi::board::types::Footprint {
+                    items: vec![builders::pack_any(pad, "kiapi.board.types.Pad")],
+                    ..Default::default()
+                },
+                "Pad",
+            )
+            .unwrap()
+        };
+        assert_eq!(norm(&prepared), norm(&observed));
+        for fault in 0..5 {
+            let mut bad = observed.clone();
+            let stack = bad.pad_stack.as_mut().unwrap();
+            match fault {
+                0 => stack.angle.as_mut().unwrap().value_degrees = 269.0,
+                1 => stack.copper_layers[0].size.as_mut().unwrap().x_nm += 1,
+                2 => {
+                    stack
+                        .front_outer_layers
+                        .as_mut()
+                        .unwrap()
+                        .solder_mask_settings
+                        .as_mut()
+                        .unwrap()
+                        .solder_mask_margin
+                        .as_mut()
+                        .unwrap()
+                        .value_nm += 1
+                }
+                3 => {
+                    stack.front_outer_layers.as_mut().unwrap().solder_paste_mode =
+                        kiapi::board::types::SolderPasteMode::SpmPaste as i32
+                }
+                _ => {
+                    stack.copper_layers[0].shape =
+                        kiapi::board::types::PadStackShape::PssCircle as i32
+                }
+            }
+            assert_ne!(norm(&prepared), norm(&bad), "real pad fault {fault} hidden");
+        }
+        for angle in [-720.0, -360.0, -0.0, 0.0, 360.0, 720.0] {
+            let mut a = prepared.clone();
+            a.pad_stack
+                .as_mut()
+                .unwrap()
+                .angle
+                .as_mut()
+                .unwrap()
+                .value_degrees = angle;
+            let mut b = a.clone();
+            b.pad_stack
+                .as_mut()
+                .unwrap()
+                .angle
+                .as_mut()
+                .unwrap()
+                .value_degrees = 0.0;
+            assert_eq!(norm(&a), norm(&b));
+        }
+    }
+
+    /// Requires a separately opened disposable project COPY and its frame-specific socket.
+    /// Mutates only the explicitly supplied board, without saving it or closing any editor.
+    #[tokio::test]
+    #[ignore = "requires isolated KiCad GUI project copy and KICAD_API_SOCKET"]
+    async fn live_library_refresh_converges_and_preserves_instance_state() {
+        let board = std::path::PathBuf::from(
+            std::env::var("KONNECT_LIVE_LIBRARY_COPY").expect("point to an isolated project COPY"),
+        );
+        let socket = std::env::var("KICAD_API_SOCKET").expect("isolated frame-specific IPC socket");
+        assert!(
+            socket.contains("api-") && socket.ends_with(".sock"),
+            "must target the isolated frame, never api.sock"
+        );
+        let client = konnect_ipc::KiCadIpcClient::new(&socket);
+        let doc = client.find_open_board(&board).unwrap();
+        let other_types = [
+            kiapi::common::types::KiCadObjectType::KotPcbTrace,
+            kiapi::common::types::KiCadObjectType::KotPcbArc,
+            kiapi::common::types::KiCadObjectType::KotPcbVia,
+            kiapi::common::types::KiCadObjectType::KotPcbZone,
+        ];
+        let other_snapshot = |client: &konnect_ipc::KiCadIpcClient| {
+            let mut items = client
+                .get_items_of_types_in(doc.clone(), &other_types)
+                .unwrap();
+            items.sort_by_key(prost::Message::encode_to_vec);
+            items
+        };
+        let other_before = other_snapshot(&client);
+        let before = client
+            .get_items_in(
+                doc.clone(),
+                kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+            )
+            .unwrap();
+        let nets = client
+            .get_nets_in(doc.clone())
+            .unwrap()
+            .into_iter()
+            .map(|n| (n.name, n.netcode))
+            .collect();
+        let routed = snapshot_routed_nets(&client, doc.clone()).unwrap();
+        let args = json!({"board":board,"references":["D2","D3","D4","J2","J5","J6","U2","U4"],"dry_run":true});
+        let filters = parse_filters(&args).unwrap();
+        let plan = plan_updates(&board, &before, &nets, &routed, &filters);
+        assert_eq!(plan.status, PlanStatus::Ready, "{plan:#?}");
+        let dry = handle_update_footprints_from_library(&args, &test_context(&socket))
+            .await
+            .unwrap();
+        let dry = result_json(&dry);
+        assert_eq!(dry["plan_revision"], plan.plan_revision);
+        let applied = handle_update_footprints_from_library(
+            &{
+                let mut apply = args.clone();
+                apply["dry_run"] = json!(false);
+                apply["expected_plan_revision"] = json!(plan.plan_revision);
+                apply
+            },
+            &test_context(&socket),
+        )
+        .await
+        .unwrap();
+        let after = client
+            .get_items_in(
+                doc.clone(),
+                kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+            )
+            .unwrap();
+        if let Ok(output) = std::env::var("KONNECT_LIVE_LIBRARY_EVIDENCE") {
+            let output = std::path::PathBuf::from(output);
+            std::fs::create_dir_all(&output).unwrap();
+            for (label, items) in [
+                ("before", &before),
+                ("prepared", &plan.prepared_items),
+                ("after", &after),
+            ] {
+                for item in items {
+                    let fp = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                        .unwrap();
+                    let reference = field_text(&fp.reference_field);
+                    if !args["references"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(reference))
+                    {
+                        continue;
+                    }
+                    std::fs::write(output.join(format!("{label}-{reference}.bin")), &item.value)
+                        .unwrap();
+                    std::fs::write(
+                        output.join(format!("{label}-{reference}.txt")),
+                        format!("{fp:#?}"),
+                    )
+                    .unwrap();
+                }
+            }
+            std::fs::write(
+                output.join("apply.json"),
+                serde_json::to_vec_pretty(&result_json(&applied)).unwrap(),
+            )
+            .unwrap();
+        }
+        assert!(!applied.is_error, "{}", result_json(&applied));
+        assert_eq!(
+            other_before,
+            other_snapshot(&client),
+            "routing and zones changed"
+        );
+        for item in &before {
+            let old =
+                kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap();
+            let actual = after
+                .iter()
+                .find(|item| {
+                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                        .unwrap()
+                        .id
+                        == old.id
+                })
+                .unwrap();
+            let new =
+                kiapi::board::types::FootprintInstance::decode(actual.value.as_slice()).unwrap();
+            let nets = decoded_pads(&old)
+                .into_iter()
+                .filter_map(|p| p.net.map(|n| (p.number, n)))
+                .collect();
+            let preserved =
+                serde_json::to_value(PreservedState::derive(&old, &new, &nets)).unwrap();
+            assert!(
+                preserved
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .all(|v| v == &json!(true)),
+                "{}: {preserved}",
+                field_text(&old.reference_field)
+            );
+            if !args["references"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(field_text(&old.reference_field)))
+            {
+                assert_eq!(item, actual, "unselected footprint changed");
+            }
+        }
+        assert_eq!(
+            verify_library_readback(&client, doc.clone(), &plan.prepared_items).unwrap(),
+            plan.prepared_items.len()
+        );
+        let repeat = handle_update_footprints_from_library(&args, &test_context(&socket))
+            .await
+            .unwrap();
+        assert_eq!(
+            result_json(&repeat)["status"],
+            "noop",
+            "{}",
+            result_json(&repeat)
         );
     }
 
