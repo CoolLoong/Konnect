@@ -25,6 +25,7 @@ struct LibraryFootprint {
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
     pad_mask_margins: Vec<Option<i64>>,
+    pad_paste_overrides: Vec<Option<kiapi::board::types::SolderPasteOverrides>>,
     text_keep_upright: Vec<bool>,
     mandatory_keep_upright: BTreeMap<String, bool>,
 }
@@ -765,10 +766,37 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     // properties as generic graphics as well would duplicate their text.
     let graphics = super::pcb_components::extract_graphic_definitions_without_properties(source)?;
     let models = parse_models(&root)?;
+    let versions = root.find_all("version");
+    anyhow::ensure!(versions.len() <= 1, "duplicate footprint format versions");
+    let version = versions
+        .first()
+        .map(|node| -> Result<u32> {
+            anyhow::ensure!(
+                node.children().map_or(0, |c| c.len()) == 2,
+                "invalid footprint format version"
+            );
+            node.get(1)
+                .and_then(konnect_sexp::SexpNode::as_str)
+                .context("invalid footprint format version")?
+                .parse()
+                .context("invalid footprint format version")
+        })
+        .transpose()?
+        .unwrap_or(0);
+    // KiCad 10 still reads pre-9.0 zero margins as inherited settings.
+    let legacy_zero_inherits = version <= 20240201;
+    let pad_paste_overrides = root
+        .find_all("pad")
+        .iter()
+        .map(|pad| parse_pad_paste_overrides(pad, legacy_zero_inherits))
+        .collect::<Result<Vec<_>>>()?;
     let pad_mask_margins = root
         .find_all("pad")
         .iter()
-        .map(|pad| parse_pad_mask_margin(pad))
+        .map(|pad| {
+            parse_pad_mask_margin(pad)
+                .map(|value| value.filter(|v| !legacy_zero_inherits || *v != 0))
+        })
         .collect::<Result<Vec<_>>>()?;
     let text_keep_upright = root
         .find_all("fp_text")
@@ -812,6 +840,7 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         graphics,
         models,
         pad_mask_margins,
+        pad_paste_overrides,
         text_keep_upright,
         mandatory_keep_upright,
     })
@@ -863,6 +892,50 @@ fn parse_pad_mask_margin(pad: &konnect_sexp::SexpNode) -> Result<Option<i64>> {
     );
     // Preserve explicit zero as Some(0), distinct from an inherited setting.
     Ok(Some((value * 1_000_000.0).round() as i64))
+}
+
+fn parse_pad_paste_overrides(
+    pad: &konnect_sexp::SexpNode,
+    legacy_zero_inherits: bool,
+) -> Result<Option<kiapi::board::types::SolderPasteOverrides>> {
+    let scalar = |tag: &str| -> Result<Option<f64>> {
+        let clauses = pad.find_all(tag);
+        anyhow::ensure!(clauses.len() <= 1, "pad has duplicate {tag} clauses");
+        let Some(clause) = clauses.first() else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            clause.children().map_or(0, |c| c.len()) == 2,
+            "pad {tag} must contain one number"
+        );
+        let value = clause
+            .get_f64(1)
+            .with_context(|| format!("pad {tag} must be numeric"))?;
+        anyhow::ensure!(value.is_finite(), "pad {tag} must be finite");
+        Ok(Some(if value == 0.0 { 0.0 } else { value })
+            .filter(|v| !legacy_zero_inherits || *v != 0.0))
+    };
+    let margin = scalar("solder_paste_margin")?
+        .map(|value| -> Result<_> {
+            anyhow::ensure!(
+                (-2147.483648..=2147.483647).contains(&value),
+                "pad solder_paste_margin must fit signed 32-bit nanometres"
+            );
+            Ok(kiapi::common::types::Distance {
+                value_nm: (value * 1_000_000.0).round() as i64,
+            })
+        })
+        .transpose()?;
+    let ratio =
+        scalar("solder_paste_margin_ratio")?.map(|value| kiapi::common::types::Ratio { value });
+    Ok(
+        (margin.is_some() || ratio.is_some()).then_some(
+            kiapi::board::types::SolderPasteOverrides {
+                solder_paste_margin: margin,
+                solder_paste_margin_ratio: ratio,
+            },
+        ),
+    )
 }
 
 fn normalized_mandatory_fields(
@@ -1629,6 +1702,8 @@ fn validate_pad(pad: &konnect_sexp::SexpNode) -> Result<()> {
                 | "tstamp"
                 | "remove_unused_layers"
                 | "solder_mask_margin"
+                | "solder_paste_margin"
+                | "solder_paste_margin_ratio"
         ) {
             bail!("pad clause '{tag}' is not supported by typed library refresh");
         }
@@ -1886,6 +1961,21 @@ fn build_updated_instance(
                             value_nm: margin,
                         }),
                     });
+                }
+            }
+            if let Some(paste) = library
+                .pad_paste_overrides
+                .get(pad_index)
+                .context("rebuilt pad order does not match paste overrides")?
+            {
+                let stack = pad
+                    .pad_stack
+                    .as_mut()
+                    .context("rebuilt pad has no pad stack")?;
+                for outer in [&mut stack.front_outer_layers, &mut stack.back_outer_layers] {
+                    outer
+                        .get_or_insert_with(Default::default)
+                        .solder_paste_settings = Some(paste.clone());
                 }
             }
             pad_index += 1;
@@ -4043,6 +4133,7 @@ mod tests {
                                         .flatten()
                                         {
                                             outer.solder_mask_settings = None;
+                                            outer.solder_paste_settings = None;
                                         }
                                     }
                                     *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
@@ -4432,6 +4523,158 @@ mod tests {
                 capture.commit_actions,
                 vec![kiapi::common::commands::CommitAction::CmaCommit]
             );
+        }
+    }
+    mod paste_regressions {
+        use super::*;
+
+        fn source(version: &str) -> String {
+            LIBRARY_FOOTPRINT.replace("20240108", version)
+                .replace("(pad \"1\" smd roundrect", "(pad \"1\" smd roundrect (solder_paste_margin 0.012) (solder_paste_margin_ratio -0.025658351)")
+                .replace("(pad \"1\" smd rect", "(pad \"1\" smd rect (solder_paste_margin 0) (solder_paste_margin_ratio 0)")
+        }
+
+        #[test]
+        fn paste_overrides_survive_each_physical_pad_front_back_and_rotation() {
+            for layer in [
+                kiapi::board::types::BoardLayer::BlFCu,
+                kiapi::board::types::BoardLayer::BlBCu,
+            ] {
+                for (version, zero_is_explicit) in [("20241229", true), ("20240108", false)] {
+                    let library = parse_library_footprint("Test:Socket", &source(version)).unwrap();
+                    let current = current_instance(layer);
+                    let prepared = build_updated_instance(
+                        &current,
+                        &library,
+                        &BTreeMap::new(),
+                        &BTreeSet::new(),
+                    )
+                    .unwrap();
+                    let after = kiapi::board::types::FootprintInstance::decode(
+                        prepared.item.value.as_slice(),
+                    )
+                    .unwrap();
+                    let pads = decoded_pads(&after);
+                    assert_eq!(pads.len(), 4);
+                    for front in [true, false] {
+                        let overrides = |p: &kiapi::board::types::Pad| {
+                            let stack = p.pad_stack.as_ref().unwrap();
+                            (if front {
+                                &stack.front_outer_layers
+                            } else {
+                                &stack.back_outer_layers
+                            })
+                            .as_ref()
+                            .and_then(|o| o.solder_paste_settings.as_ref())
+                            .cloned()
+                        };
+                        let first = overrides(&pads[0]).unwrap();
+                        assert_eq!(first.solder_paste_margin.unwrap().value_nm, 12000);
+                        assert_eq!(first.solder_paste_margin_ratio.unwrap().value, -0.025658351);
+                        if zero_is_explicit {
+                            let second = overrides(&pads[1]).unwrap();
+                            assert_eq!(second.solder_paste_margin.unwrap().value_nm, 0);
+                            assert_eq!(second.solder_paste_margin_ratio.unwrap().value, 0.0);
+                        } else {
+                            assert!(overrides(&pads[1]).is_none());
+                        }
+                        assert!(overrides(&pads[2]).is_none());
+                        assert!(overrides(&pads[3]).is_none());
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn format_version_distinguishes_inherited_and_explicit_zero_mask() {
+            for (version, expected) in [("20240108", None), ("20241229", Some(0))] {
+                let source = LIBRARY_FOOTPRINT.replace("20240108", version).replace(
+                    "(pad \"1\" smd rect",
+                    "(pad \"1\" smd rect (solder_mask_margin 0)",
+                );
+                let library = parse_library_footprint("Test:Socket", &source).unwrap();
+                assert_eq!(library.pad_mask_margins[1], expected);
+            }
+        }
+
+        #[tokio::test]
+        async fn missing_paste_after_accepted_write_is_uncertain_and_not_confirmed_applied() {
+            let (_tmp, board, items) = plan_fixture();
+            // Only paste differs, so the independent fault cannot be detected
+            // merely by the older mask-margin guard.
+            let source = KICAD_LIBRARY_FOOTPRINT.replace(
+                "(pad \"1\" smd roundrect",
+                "(pad \"1\" smd roundrect (solder_paste_margin_ratio -0.025658351)",
+            );
+            std::fs::write(
+                board.parent().unwrap().join("Test.pretty/Socket.kicad_mod"),
+                source,
+            )
+            .unwrap();
+            for lose_paste in [false, true] {
+                let mock =
+                    spawn_planner_mock_with_fault(&board, items[0].clone(), false, lose_paste);
+                let ctx = test_context(&mock.url);
+                let dry = handle_update_footprints_from_library(&json!({"board":board}), &ctx)
+                    .await
+                    .unwrap();
+                assert_eq!(result_json(&dry)["status"], "ready");
+                let request = json!({"board":board,"dry_run":false,"expected_plan_revision":result_json(&dry)["plan_revision"]});
+                let result = handle_update_footprints_from_library(&request, &ctx)
+                    .await
+                    .unwrap();
+                let body = result_json(&result);
+                if lose_paste {
+                    assert!(result.is_error);
+                    assert_eq!(body["status"], "uncertain");
+                    assert_eq!(body["coverage"]["changed"]["applied"], 0);
+                } else {
+                    assert!(!result.is_error);
+                    assert_eq!(body["status"], "applied");
+                    assert_eq!(body["coverage"]["changed"]["applied"], 1);
+                }
+                assert_eq!(mock.capture.lock().unwrap().update_batches, vec![1]);
+                println!(
+                    "REGRESSION_MCP_PASTE_EVIDENCE {}",
+                    json!({"request":request,"response":body,"fault":lose_paste,"source":"independent_mock_ipc_readback"})
+                );
+            }
+        }
+
+        #[test]
+        fn malformed_and_ambiguous_format_versions_refuse() {
+            for replacement in [
+                "(version NaN)",
+                "(version 20241229 1)",
+                "(version 20241229) (version 20240108)",
+            ] {
+                let source = source("20241229").replace("(version 20241229)", replacement);
+                assert!(
+                    parse_library_footprint("Test:Socket", &source).is_err(),
+                    "must refuse {replacement}"
+                );
+            }
+        }
+
+        #[test]
+        fn malformed_paste_and_unmodelled_mechanical_property_refuse() {
+            for clause in [
+                "(solder_paste_margin_ratio NaN)",
+                "(solder_paste_margin_ratio 0 1)",
+                "(solder_paste_margin_ratio 0) (solder_paste_margin_ratio 0.2)",
+                "(solder_paste_margin 2148)",
+                "(solder_paste_margin inf)",
+                "(property pad_prop_mechanical)",
+            ] {
+                let source = LIBRARY_FOOTPRINT.replace(
+                    "(pad \"1\" smd rect",
+                    &format!("(pad \"1\" smd rect {clause}"),
+                );
+                assert!(
+                    parse_library_footprint("Test:Socket", &source).is_err(),
+                    "must refuse {clause}"
+                );
+            }
         }
     }
 }
