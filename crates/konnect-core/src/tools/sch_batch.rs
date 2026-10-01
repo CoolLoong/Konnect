@@ -39,6 +39,7 @@ use super::sch_wiring::{
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
+        super::schematic_property_recovery::tool(),
         tool!(
             "batch_connect_to_net",
             "Connect multiple component pins to a named net. By default it adds a net label \
@@ -1297,7 +1298,14 @@ async fn handle_batch_edit_observed(
         return Ok(result);
     }
     if content != expected {
-        write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+        if let Err(error) = write_atomic_if_unchanged(&sch_path, &expected, &content) {
+            let unchanged = read_consistent(&sch_path).is_ok_and(|after| after == expected);
+            let mut result = CallToolResult::json(
+                &json!({"status":if unchanged {"refused"} else {"uncertain"},"updated_count":0,"updated_unit_copies":0,"created_unit_copies":0,"updated":[],"potentially_applied":!unchanged,"attempted_updates":changed,"errors":[error.to_string()],"recovery":"Inspect the saved schematic before retrying if the source is no longer independently confirmed."}),
+            );
+            result.is_error = true;
+            return Ok(result);
+        }
     }
     after_write(&sch_path);
     let readback = read_consistent(&sch_path);

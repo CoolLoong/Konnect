@@ -20,6 +20,7 @@ pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
     "batch_place_components",
     "delete_via",
     "move_via",
+    "repair_schematic_property_prefixes",
     "run_design_review",
     "set_custom_design_rule",
 ];
