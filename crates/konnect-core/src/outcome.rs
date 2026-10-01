@@ -19,6 +19,7 @@ pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
     "annotate_schematic",
     "batch_place_components",
     "delete_via",
+    "edit_footprint_field_layout",
     "move_via",
     "repair_schematic_property_prefixes",
     "relink_pcb_footprint_to_schematic",
