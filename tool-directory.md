@@ -13,7 +13,7 @@ Compatibility notes for removed or narrowed arguments are recorded in
 ## Overview
 
 - **21 toolsets** organized into 10 categories
-- **232 registered tools** + **7 always-visible meta-tools** = **239 total**
+- **233 registered tools** + **7 always-visible meta-tools** = **240 total**
 - **Discovery pattern**: the server pre-loads only the **starter kit** (`project`, `config`) so baseline `tools/list` costs ~2K tokens instead of ~23K. The LLM reads `list_toolboxes` → calls `load_toolset(name)` to expose additional tools on demand; `unload_toolset(name)` prunes them. `tools/list_changed` is notified on every mutation. If the LLM calls a tool whose toolset isn't loaded, the error names the owning toolset so recovery is a single `load_toolset` hop. `load_toolset` also accepts an array of names to load several toolsets with a single `tools/list` refresh.
 - **Observability**: every `tools/call` is recorded — ring buffer of the last 100 calls + per-tool counters + JSONL at `<konnect dir>/logs/calls.jsonl`. The LLM self-diagnoses via `get_recent_calls` and `server_stats`.
 
@@ -193,7 +193,7 @@ and Windows servers do not.
 | `batch_place_components` | Place multiple symbols from KiCAD libraries in one write with committed-file readback. Copies each library Value and Footprint unless that entry explicitly overrides it, preserves every saved hierarchy instance, and preflights stale metadata before any placement. Pass explicit references -- there is no auto-numbering; an omitted reference becomes '?' like an eeschema-unannotated symbol, same as `add_schematic_component`. |
 | `batch_connect_pins` | Connect multiple component pin pairs by reference and pin number, in a single file read/write cycle. |
 
-### `sch_export` · 10 tools
+### `sch_export` · 11 tools
 **Purpose:** Export schematic to SVG/PDF/PNG/netlist, run ERC, and synchronize a live PCB.
 **Source:** [`crates/konnect-core/src/tools/sch_export.rs`](crates/konnect-core/src/tools/sch_export.rs)
 
@@ -209,6 +209,7 @@ and Windows servers do not.
 | `run_erc` | Run the Electrical Rules Check via kicad-cli and return violations filtered by severity. A report that is not in kicad-cli's ERC shape is an error, never zero violations. |
 | `fix_connectivity` | Scan for near-miss wire endpoints within `snap_tolerance` of a pin/label and snap them into place. Supports `dry_run`. |
 | `update_pcb_from_schematic` | Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. Defaults to a non-mutating dry run; apply requires its exact plan revision. Preserves placement, routing, board-only footprints, and footprint artwork. A symbol with no footprint assigned is reported under `unassigned_footprints` and the sync proceeds for every other component. A library footprint that cannot be placed, or a connected pad its footprint does not have, makes the dry run a conflict whose diagnostics name the footprint and every part that needs it. |
+| `relink_pcb_footprint_to_schematic` | Explicitly relink one existing footprint after a symbol UUID replacement. Requires exact UUID, reference and old/new full paths; proves the same footprint and every physical pad net. Dry run binds all raw live PCB items and saved hierarchy bytes; apply requires its revision, changes only the path, and independently verifies the complete board. Ordinary sync retains strict conflict handling. |
 
 ### `sch_hierarchy` · 12 tools
 **Purpose:** Hierarchical sheets: add/edit/move/delete/duplicate a sheet, hierarchy and page-numbering queries, import/add/edit/delete sheet pins, pin/label sync validation.
