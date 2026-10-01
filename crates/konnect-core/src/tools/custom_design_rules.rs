@@ -131,6 +131,23 @@ fn candidate(source: Option<&str>, definition: &str) -> Result<(String, String, 
         !form.node.find_all("constraint").is_empty(),
         "rule needs at least one constraint"
     );
+    for singleton in ["condition", "layer", "severity"] {
+        ensure!(
+            form.node.find_all(singleton).len() <= 1,
+            "duplicate {singleton} clauses"
+        );
+    }
+    let mut constraint_types = HashSet::new();
+    for constraint in form.node.find_all("constraint") {
+        let kind = constraint
+            .get(1)
+            .and_then(SexpNode::as_str)
+            .context("missing constraint type")?;
+        ensure!(
+            constraint_types.insert(kind),
+            "duplicate constraint type '{kind}'"
+        );
+    }
     let source = source.unwrap_or("(version 1)\n");
     let existing = forms(source)?;
     ensure!(
@@ -562,6 +579,14 @@ mod tests {
         assert_ne!(revision(None), revision(Some("")));
         let quoted = "(rule \"x # ( ) \\\" y\" # comment\n (constraint assertion \"0\"))";
         assert!(candidate(None, quoted).is_ok());
+        for duplicate in [
+            "(rule x (condition \"0\") (condition \"1\") (constraint assertion \"0\"))",
+            "(rule x (severity error) (severity ignore) (constraint assertion \"0\"))",
+            "(rule x (layer F.Cu) (layer B.Cu) (constraint assertion \"0\"))",
+            "(rule x (constraint edge_clearance (min 0.1mm)) (constraint edge_clearance (min 0.2mm)))",
+        ] {
+            assert!(candidate(None, duplicate).is_err(), "{duplicate}");
+        }
     }
 
     #[cfg(unix)]
