@@ -24,6 +24,9 @@ struct LibraryFootprint {
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
+    pad_mask_margins: Vec<Option<i64>>,
+    text_keep_upright: Vec<bool>,
+    mandatory_keep_upright: BTreeMap<String, bool>,
 }
 
 #[derive(Debug)]
@@ -295,10 +298,25 @@ pub(crate) async fn handle_update_footprints_from_library(
                 return Ok(plan_response(&plan, false));
             }
 
-            let update_count = plan.prepared_items.len();
-            client.run_commit("Update footprints from libraries", |client| {
-                client.update_items_in(document, std::mem::take(&mut plan.prepared_items))
-            })?;
+            let expected=plan.prepared_items.clone();
+            let mutation=client.run_commit("Update footprints from libraries", |client| {
+                client.update_items_in(document.clone(), std::mem::take(&mut plan.prepared_items))
+            });
+            let update_count=match mutation.and_then(|()|verify_library_readback(client,document,&expected)) {
+                Ok(count)=>count,
+                Err(error)=>{
+                    let mut result=plan_response(&plan,false);
+                    result.is_error=true;
+                    if let Some(ToolContent::Text{text})=result.content.first_mut(){
+                        let mut body:serde_json::Value=serde_json::from_str(text).expect("plan response JSON");
+                        body["status"]=json!("uncertain");
+                        body["error"]=json!({"kind":"mutation_outcome_uncertain","operation":"update_footprints_from_library","path":ipc_board_path,"reason":format!("{error:#}")});
+                        body["recovery"]=json!("Inspect the live board before retrying; the commit may have applied. Do not assume rollback or save automatically.");
+                        *text=body.to_string();
+                    }
+                    return Ok(result);
+                }
+            };
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
             plan.coverage.unchanged.applied = plan.coverage.unchanged.planned;
@@ -747,6 +765,28 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
     // properties as generic graphics as well would duplicate their text.
     let graphics = super::pcb_components::extract_graphic_definitions_without_properties(source)?;
     let models = parse_models(&root)?;
+    let pad_mask_margins = root
+        .find_all("pad")
+        .iter()
+        .map(|pad| parse_pad_mask_margin(pad))
+        .collect::<Result<Vec<_>>>()?;
+    let text_keep_upright = root
+        .find_all("fp_text")
+        .iter()
+        .filter(|text| text.get(1).and_then(konnect_sexp::SexpNode::as_str) == Some("user"))
+        .map(|text| parse_keep_upright(text, "fp_text user"))
+        .collect::<Result<Vec<_>>>()?;
+    let mandatory_keep_upright = root
+        .find_all("property")
+        .iter()
+        .filter_map(|property| {
+            let name = property.get(1).and_then(konnect_sexp::SexpNode::as_str)?;
+            (matches!(name, "Reference" | "Value" | "Datasheet" | "Description")
+                && property.find("unlocked").is_some())
+            .then_some((name, property))
+        })
+        .map(|(name, property)| Ok((name.to_owned(), parse_keep_upright(property, name)?)))
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let attributes = parse_attributes(&root)?;
     let definition = kiapi::board::types::Footprint {
         id: Some(kiapi::common::types::LibraryIdentifier {
@@ -771,7 +811,153 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         pads,
         graphics,
         models,
+        pad_mask_margins,
+        text_keep_upright,
+        mandatory_keep_upright,
     })
+}
+
+/// KiCad's `(unlocked yes)` means NOT keep-upright, not an editing lock.
+/// TextAttributes.keep_upright round-trips through EDA_TEXT in KiCad 10.0.6.
+fn parse_keep_upright(node: &konnect_sexp::SexpNode, subject: &str) -> Result<bool> {
+    let clauses = node.find_all("unlocked");
+    anyhow::ensure!(
+        clauses.len() <= 1,
+        "{subject} has duplicate 'unlocked' clauses"
+    );
+    match clauses.first() {
+        None => Ok(true),
+        Some(clause) => {
+            anyhow::ensure!(
+                clause.children().map_or(0, |children| children.len()) == 2,
+                "{subject} 'unlocked' must have one yes/no value"
+            );
+            match clause.get(1).and_then(konnect_sexp::SexpNode::as_str) {
+                Some("yes") => Ok(false),
+                Some("no") => Ok(true),
+                _ => bail!("{subject} 'unlocked' must be yes or no"),
+            }
+        }
+    }
+}
+
+fn parse_pad_mask_margin(pad: &konnect_sexp::SexpNode) -> Result<Option<i64>> {
+    let clauses = pad.find_all("solder_mask_margin");
+    anyhow::ensure!(
+        clauses.len() <= 1,
+        "pad has duplicate solder_mask_margin clauses"
+    );
+    let Some(clause) = clauses.first() else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        clause.children().map_or(0, |children| children.len()) == 2,
+        "pad solder_mask_margin must contain one distance"
+    );
+    let value = clause
+        .get_f64(1)
+        .context("pad solder_mask_margin must be a numeric distance")?;
+    anyhow::ensure!(
+        value.is_finite() && (-2147.483648..=2147.483647).contains(&value),
+        "pad solder_mask_margin must fit signed 32-bit nanometres"
+    );
+    // Preserve explicit zero as Some(0), distinct from an inherited setting.
+    Ok(Some((value * 1_000_000.0).round() as i64))
+}
+
+fn normalized_mandatory_fields(
+    footprint: &kiapi::board::types::FootprintInstance,
+) -> Vec<Option<kiapi::board::types::Field>> {
+    [
+        &footprint.reference_field,
+        &footprint.value_field,
+        &footprint.datasheet_field,
+        &footprint.description_field,
+    ]
+    .iter()
+    .map(|field| {
+        field.as_ref().map(|field| {
+            let mut field = field.clone();
+            field.id = None;
+            if let Some(text) = field.text.as_mut() {
+                text.id = None;
+                text.parent = None;
+            }
+            field
+        })
+    })
+    .collect()
+}
+
+fn verify_library_readback(
+    client: &konnect_ipc::KiCadIpcClient,
+    document: kiapi::common::types::DocumentSpecifier,
+    expected: &[prost_types::Any],
+) -> Result<usize> {
+    let items = client.get_items_in(
+        document,
+        kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+    )?;
+    let mut observed = BTreeMap::new();
+    for item in items {
+        anyhow::ensure!(
+            konnect_ipc::builders::any_is(&item, "kiapi.board.types.FootprintInstance"),
+            "unexpected footprint Any in library update readback"
+        );
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+        let id = footprint
+            .id
+            .as_ref()
+            .context("readback footprint has no UUID")?
+            .value
+            .clone();
+        anyhow::ensure!(
+            observed.insert(id, footprint).is_none(),
+            "duplicate footprint UUID in readback"
+        );
+    }
+    let mut count = 0;
+    for item in expected {
+        let wanted = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+        let id = &wanted
+            .id
+            .as_ref()
+            .context("prepared footprint has no UUID")?
+            .value;
+        let after = observed.get(id).with_context(|| {
+            format!("updated footprint '{id}' missing from independent readback")
+        })?;
+        anyhow::ensure!(
+            changed_domains(&wanted, after)?.is_empty(),
+            "library-owned attributes differ after update of '{id}'"
+        );
+        let nets = wanted
+            .definition
+            .as_ref()
+            .context("prepared footprint has no definition")?
+            .items
+            .iter()
+            .filter(|i| konnect_ipc::builders::any_is(i, "kiapi.board.types.Pad"))
+            .map(|i| kiapi::board::types::Pad::decode(i.value.as_slice()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|p| p.net.map(|n| (p.number, n)))
+            .collect();
+        let preserved = PreservedState::derive(&wanted, after, &nets);
+        anyhow::ensure!(
+            preserved.position
+                && preserved.rotation
+                && preserved.layer
+                && preserved.locked
+                && preserved.kiid
+                && preserved.symbol_path
+                && preserved.pad_nets
+                && preserved.instance_overrides,
+            "instance state differs after library update of '{id}'"
+        );
+        count += 1;
+    }
+    Ok(count)
 }
 
 fn parse_library_properties(root: &konnect_sexp::SexpNode) -> Result<ParsedLibraryProperties> {
@@ -911,6 +1097,9 @@ fn parse_library_property(
                     bail!("property '{name}' '{tag}' must contain exactly one identifier");
                 }
             }
+            "unlocked" => {
+                parse_keep_upright(property, name)?;
+            }
             "effects" => {
                 if attributes.is_some() {
                     bail!("property '{name}' contains duplicate 'effects' clauses");
@@ -931,8 +1120,10 @@ fn parse_library_property(
         position.with_context(|| format!("property '{name}' is missing its 'at' clause"))?;
     let layer =
         layer.with_context(|| format!("property '{name}' is missing its 'layer' clause"))?;
+    let keep_upright = parse_keep_upright(property, name)?;
     let mut attributes =
         attributes.with_context(|| format!("property '{name}' is missing its 'effects' clause"))?;
+    attributes.keep_upright = keep_upright;
     attributes.angle = Some(kiapi::common::types::Angle {
         value_degrees: rotation,
     });
@@ -1254,6 +1445,9 @@ fn validate_user_text(text: &konnect_sexp::SexpNode) -> Result<()> {
                     bail!("fp_text user '{tag}' must contain exactly one identifier");
                 }
             }
+            "unlocked" => {
+                parse_keep_upright(text, "fp_text user")?;
+            }
             "effects" => {
                 if saw_effects {
                     bail!("fp_text user contains duplicate 'effects' clauses");
@@ -1434,6 +1628,7 @@ fn validate_pad(pad: &konnect_sexp::SexpNode) -> Result<()> {
                 | "uuid"
                 | "tstamp"
                 | "remove_unused_layers"
+                | "solder_mask_margin"
         ) {
             bail!("pad clause '{tag}' is not supported by typed library refresh");
         }
@@ -1453,6 +1648,7 @@ fn validate_pad(pad: &konnect_sexp::SexpNode) -> Result<()> {
             }
         }
     }
+    parse_pad_mask_margin(pad)?;
     Ok(())
 }
 
@@ -1668,9 +1864,31 @@ fn build_updated_instance(
             konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
         }),
     );
+    let mut pad_index = 0;
+    let mut text_index = 0;
     for item in &mut definition.items {
         if item.type_url.ends_with("kiapi.board.types.Pad") {
             let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+            if let Some(margin) = *library
+                .pad_mask_margins
+                .get(pad_index)
+                .context("rebuilt pad order does not match library")?
+            {
+                let stack = pad
+                    .pad_stack
+                    .as_mut()
+                    .context("rebuilt pad has no pad stack")?;
+                for outer in [&mut stack.front_outer_layers, &mut stack.back_outer_layers] {
+                    outer
+                        .get_or_insert_with(Default::default)
+                        .solder_mask_settings = Some(kiapi::board::types::SolderMaskOverrides {
+                        solder_mask_margin: Some(kiapi::common::types::Distance {
+                            value_nm: margin,
+                        }),
+                    });
+                }
+            }
+            pad_index += 1;
             pad.net = old_nets
                 .get(&pad.number)
                 .map(|old| kiapi::board::types::Net {
@@ -1682,9 +1900,18 @@ fn build_updated_instance(
                     name: old.name.clone(),
                 });
             *item = konnect_ipc::builders::pack_any(&pad, "kiapi.board.types.Pad");
-        } else if is_back && item.type_url.ends_with("kiapi.board.types.BoardText") {
+        } else if item.type_url.ends_with("kiapi.board.types.BoardText") {
             let mut text = kiapi::board::types::BoardText::decode(item.value.as_slice())?;
-            if is_side_specific_layer(text.layer) {
+            text.text
+                .as_mut()
+                .and_then(|text| text.attributes.as_mut())
+                .context("rebuilt text has no attributes")?
+                .keep_upright = *library
+                .text_keep_upright
+                .get(text_index)
+                .context("rebuilt text order does not match library")?;
+            text_index += 1;
+            if is_back && is_side_specific_layer(text.layer) {
                 if let Some(attributes) =
                     text.text.as_mut().and_then(|text| text.attributes.as_mut())
                 {
@@ -1702,6 +1929,34 @@ fn build_updated_instance(
         rotation,
         is_back,
     )?;
+    for (name, keep_upright) in &library.mandatory_keep_upright {
+        let (field, definition_field) = match name.as_str() {
+            "Reference" => (
+                &mut updated.reference_field,
+                &mut definition.reference_field,
+            ),
+            "Value" => (&mut updated.value_field, &mut definition.value_field),
+            "Datasheet" => (
+                &mut updated.datasheet_field,
+                &mut definition.datasheet_field,
+            ),
+            "Description" => (
+                &mut updated.description_field,
+                &mut definition.description_field,
+            ),
+            _ => unreachable!("only mandatory fields collected"),
+        };
+        for field in [field, definition_field].into_iter().flatten() {
+            if let Some(attributes) = field
+                .text
+                .as_mut()
+                .and_then(|text| text.text.as_mut())
+                .and_then(|text| text.attributes.as_mut())
+            {
+                attributes.keep_upright = *keep_upright;
+            }
+        }
+    }
     updated.definition = Some(definition);
     apply_field_value(&mut updated.datasheet_field, library.datasheet.as_deref());
     apply_field_value(
@@ -1833,7 +2088,11 @@ fn transform_library_property(
         local_angle
     };
     attributes.angle = Some(kiapi::common::types::Angle {
-        value_degrees: readable_property_angle(local_angle + footprint_rotation),
+        value_degrees: if attributes.keep_upright {
+            readable_property_angle(local_angle + footprint_rotation)
+        } else {
+            (local_angle + footprint_rotation).rem_euclid(360.0)
+        },
     });
     if is_back {
         attributes.mirrored = !attributes.mirrored;
@@ -2031,7 +2290,8 @@ fn changed_domains(
     {
         changed.insert(ChangedDomain::Models);
     }
-    if current_definition.attributes != updated_definition.attributes
+    if normalized_mandatory_fields(current) != normalized_mandatory_fields(updated)
+        || current_definition.attributes != updated_definition.attributes
         || field_text(&current_definition.datasheet_field)
             != field_text(&updated_definition.datasheet_field)
         || field_text(&current_definition.description_field)
@@ -2061,6 +2321,7 @@ fn normalized_items(
             if suffix == "Pad" {
                 let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
                 pad.id = None;
+                pad.parent = None;
                 pad.net = None;
                 pad.pad_to_die_length = None;
                 pad.symbol_pin = None;
@@ -2091,6 +2352,7 @@ fn normalized_items(
                 field.id = None;
                 if let Some(text) = field.text.as_mut() {
                     text.id = None;
+                    text.parent = None;
                 }
                 Ok(field.encode_to_vec())
             } else {
@@ -2112,6 +2374,7 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                     kiapi::board::types::BoardGraphicShape::decode(item.value.as_slice()).map(
                         |mut shape| {
                             shape.id = None;
+                            shape.parent = None;
                             shape.net = None;
                             shape.locked = kiapi::common::types::LockedState::LsUnlocked as i32;
                             if let Some(graphic) = shape.shape.as_mut() {
@@ -2161,6 +2424,7 @@ fn normalized_graphics(definition: &kiapi::board::types::Footprint) -> Result<Ve
                     kiapi::board::types::BoardText::decode(item.value.as_slice()).map(
                         |mut text| {
                             text.id = None;
+                            text.parent = None;
                             text.encode_to_vec()
                         },
                     ),
@@ -2893,13 +3157,13 @@ mod tests {
     fn parser_names_unrepresentable_or_ambiguous_custom_properties() {
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unmodeled_attribute yes)\n\t\t(at",
         );
         assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
         let error = parse_library_footprint("Test:Socket", &unsupported).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("AssemblyVendor"), "{message}");
-        assert!(message.contains("unlocked"), "{message}");
+        assert!(message.contains("unmodeled_attribute"), "{message}");
 
         let duplicate = KICAD_LIBRARY_FOOTPRINT.replace(
             "\"KiLib_Generator\" \"konnect_test_generator\"",
@@ -2924,7 +3188,9 @@ mod tests {
             let authored = format!("\t(property \"{name}\" \"{value}\"\n\t\t(at");
             let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
                 &authored,
-                &format!("\t(property \"{name}\" \"{value}\"\n\t\t(unlocked yes)\n\t\t(at"),
+                &format!(
+                    "\t(property \"{name}\" \"{value}\"\n\t\t(unmodeled_attribute yes)\n\t\t(at"
+                ),
             );
             assert_ne!(unsupported, KICAD_LIBRARY_FOOTPRINT);
             match parse_library_footprint("Test:Socket", &unsupported) {
@@ -2932,7 +3198,7 @@ mod tests {
                 Err(error) => {
                     let message = error.to_string();
                     assert!(message.contains(name), "{message}");
-                    assert!(message.contains("unlocked"), "{message}");
+                    assert!(message.contains("unmodeled_attribute"), "{message}");
                 }
             }
 
@@ -3040,11 +3306,11 @@ mod tests {
 
         let solder_margin = LIBRARY_FOOTPRINT.replace(
             "(roundrect_rratio 0.2))",
-            "(roundrect_rratio 0.2) (solder_mask_margin 0.05))",
+            "(roundrect_rratio 0.2) (unmodeled_pad_margin 0.05))",
         );
         let error = parse_library_footprint("Test:Socket", &solder_margin).unwrap_err();
         assert!(
-            error.to_string().contains("solder_mask_margin"),
+            error.to_string().contains("unmodeled_pad_margin"),
             "{error:#}"
         );
     }
@@ -3054,8 +3320,8 @@ mod tests {
         for (from, to, expected) in [
             (
                 "(at 0 1.5 0) (layer \"F.Fab\")",
-                "(at 0 1.5 0) (unlocked yes) (layer \"F.Fab\")",
-                "unlocked",
+                "(at 0 1.5 0) (unmodeled_text_attribute yes) (layer \"F.Fab\")",
+                "unmodeled_text_attribute",
             ),
             (
                 "(effects (font (size 0.8 0.8) (thickness 0.11)))",
@@ -3290,7 +3556,7 @@ mod tests {
         let (temp, board, items) = plan_fixture();
         let unsupported = KICAD_LIBRARY_FOOTPRINT.replace(
             "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(at",
-            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unlocked yes)\n\t\t(at",
+            "\t(property \"AssemblyVendor\" \"Example Assembly\"\n\t\t(unmodeled_attribute yes)\n\t\t(at",
         );
         std::fs::write(
             temp.path().join("Test.pretty/Socket.kicad_mod"),
@@ -3312,7 +3578,7 @@ mod tests {
         assert!(plan.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "unsupported_library_footprint"
                 && diagnostic.message.contains("AssemblyVendor")
-                && diagnostic.message.contains("unlocked")
+                && diagnostic.message.contains("unmodeled_attribute")
         }));
     }
 
@@ -3659,6 +3925,15 @@ mod tests {
         footprint: prost_types::Any,
         fail_update: bool,
     ) -> PlannerMock {
+        spawn_planner_mock_with_fault(board, footprint, fail_update, false)
+    }
+
+    fn spawn_planner_mock_with_fault(
+        board: &Path,
+        mut footprint: prost_types::Any,
+        fail_update: bool,
+        lose_mask: bool,
+    ) -> PlannerMock {
         use nng::options::Options;
 
         static NEXT_MOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -3739,6 +4014,36 @@ mod tests {
                         .unwrap()
                         .update_batches
                         .push(update.items.len());
+                    if !fail_update {
+                        footprint = update.items[0].clone();
+                        if lose_mask {
+                            let mut fp = kiapi::board::types::FootprintInstance::decode(
+                                footprint.value.as_slice(),
+                            )
+                            .unwrap();
+                            for item in &mut fp.definition.as_mut().unwrap().items {
+                                if builders::any_is(item, "kiapi.board.types.Pad") {
+                                    let mut pad =
+                                        kiapi::board::types::Pad::decode(item.value.as_slice())
+                                            .unwrap();
+                                    if let Some(stack) = pad.pad_stack.as_mut() {
+                                        for outer in [
+                                            &mut stack.front_outer_layers,
+                                            &mut stack.back_outer_layers,
+                                        ]
+                                        .into_iter()
+                                        .flatten()
+                                        {
+                                            outer.solder_mask_settings = None;
+                                        }
+                                    }
+                                    *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
+                                }
+                            }
+                            footprint =
+                                builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
+                        }
+                    }
                     let updated_items = update
                         .items
                         .into_iter()
@@ -3836,20 +4141,26 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let applied = handle_update_footprints_from_library(
-            &serde_json::json!({
-                "board": board,
-                "dry_run": false,
-                "expected_plan_revision": revision
-            }),
-            &context,
-        )
-        .await
-        .unwrap();
-
-        let applied = result_json(&applied);
+        let mut config = context.config.clone();
+        config.eager_toolsets = true;
+        let handler = crate::mcp::handler::McpHandler::new(config).await.unwrap();
+        let request = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_footprints_from_library","arguments":{"board":board,"dry_run":false,"expected_plan_revision":revision}}});
+        let response = handler
+            .handle_message(request.clone())
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(response["isError"], false);
+        println!(
+            "MOCK_MCP_LIBRARY_EVIDENCE {}",
+            json!({"source":"mock_kicad_ipc","request":request,"response":response})
+        );
+        let applied: serde_json::Value =
+            serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(applied["status"], "applied");
         assert_eq!(applied["coverage"]["changed"]["applied"], 1);
+        println!("MOCK_MCP_LIBRARY_EVIDENCE {}", applied);
         let capture = mock.capture.lock().unwrap();
         assert_eq!(capture.begin_count, 1);
         assert_eq!(capture.update_batches, vec![1]);
@@ -3884,7 +4195,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result_json(&failed)["status"], "conflict");
+        assert_eq!(result_json(&failed)["status"], "uncertain");
+        assert_eq!(
+            result_json(&failed)["error"]["kind"],
+            "mutation_outcome_uncertain"
+        );
+        assert_eq!(result_json(&failed)["coverage"]["changed"]["applied"], 0);
         let capture = mock.capture.lock().unwrap();
         assert_eq!(capture.begin_count, 1);
         assert_eq!(capture.update_batches, vec![1]);
@@ -3892,5 +4208,204 @@ mod tests {
             capture.commit_actions,
             vec![kiapi::common::commands::CommitAction::CmaDrop]
         );
+    }
+    mod new_properties_tests {
+        use super::*;
+
+        fn legal_source() -> String {
+            KICAD_LIBRARY_FOOTPRINT
+                .replace(
+                    "(property \"Datasheet\" \"new-datasheet.pdf\"",
+                    "(property \"Datasheet\" \"new-datasheet.pdf\" (unlocked yes)",
+                )
+                .replace(
+                    "(property \"AssemblyVendor\" \"Example Assembly\"",
+                    "(property \"AssemblyVendor\" \"Example Assembly\" (unlocked yes)",
+                )
+                .replace("(at 0.5 0.75 15)", "(at 0.5 0.75 180)")
+                .replace(
+                    "(fp_text user \"${REFERENCE}\"",
+                    "(fp_text user \"${REFERENCE}\" (unlocked yes)",
+                )
+                .replace(
+                    "(pad \"1\" smd roundrect",
+                    "(pad \"1\" smd roundrect (solder_mask_margin 0.025)",
+                )
+                .replace(
+                    "(pad \"1\" smd rect",
+                    "(pad \"1\" smd rect (solder_mask_margin 0)",
+                )
+                .replace(
+                    "(pad \"2\" thru_hole circle",
+                    "(pad \"2\" thru_hole circle (solder_mask_margin -0.01)",
+                )
+        }
+        fn attrs(field: &kiapi::board::types::Field) -> &kiapi::common::types::TextAttributes {
+            field
+                .text
+                .as_ref()
+                .unwrap()
+                .text
+                .as_ref()
+                .unwrap()
+                .attributes
+                .as_ref()
+                .unwrap()
+        }
+        #[test]
+        fn legal_properties_survive_front_back_and_non_cardinal_rotation() {
+            let source = legal_source();
+            let library = parse_library_footprint("Test:Socket", &source).unwrap();
+            for layer in [
+                kiapi::board::types::BoardLayer::BlFCu,
+                kiapi::board::types::BoardLayer::BlBCu,
+            ] {
+                let current = current_instance(layer);
+                let prepared =
+                    build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new())
+                        .unwrap();
+                let updated =
+                    kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
+                        .unwrap();
+                assert_eq!(updated.locked, current.locked);
+                assert_eq!(updated.position, current.position);
+                assert_eq!(
+                    updated.reference_field, current.reference_field,
+                    "placed reference presentation preserved without explicit library unlocked"
+                );
+                assert!(!attrs(updated.datasheet_field.as_ref().unwrap()).keep_upright);
+                let vendor = decoded_custom_fields(&updated)
+                    .into_iter()
+                    .find(|f| f.name == "AssemblyVendor")
+                    .unwrap();
+                assert!(!attrs(&vendor).keep_upright);
+                assert_eq!(
+                    attrs(&vendor).angle.as_ref().unwrap().value_degrees,
+                    if layer == kiapi::board::types::BoardLayer::BlBCu {
+                        37.0
+                    } else {
+                        217.0
+                    }
+                );
+                assert_eq!(
+                    attrs(&vendor).mirrored,
+                    layer == kiapi::board::types::BoardLayer::BlBCu
+                );
+                let text = updated
+                    .definition
+                    .as_ref()
+                    .unwrap()
+                    .items
+                    .iter()
+                    .find(|i| builders::any_is(i, "kiapi.board.types.BoardText"))
+                    .unwrap();
+                let text = kiapi::board::types::BoardText::decode(text.value.as_slice()).unwrap();
+                assert!(
+                    !text
+                        .text
+                        .as_ref()
+                        .unwrap()
+                        .attributes
+                        .as_ref()
+                        .unwrap()
+                        .keep_upright
+                );
+                let pads = decoded_pads(&updated);
+                assert_eq!(
+                    pads.iter().map(|p| p.number.as_str()).collect::<Vec<_>>(),
+                    vec!["1", "1", "2", "3"]
+                );
+                for (pad, margin) in pads
+                    .iter()
+                    .zip([Some(25_000), Some(0), Some(-10_000), None])
+                {
+                    let stack = pad.pad_stack.as_ref().unwrap();
+                    for outer in [&stack.front_outer_layers, &stack.back_outer_layers] {
+                        let got = outer
+                            .as_ref()
+                            .and_then(|o| o.solder_mask_settings.as_ref())
+                            .and_then(|s| s.solder_mask_margin.as_ref())
+                            .map(|d| d.value_nm);
+                        assert_eq!(
+                            got, margin,
+                            "physical pad {} explicit zero/inheritance and front/back preserved",
+                            pad.number
+                        );
+                    }
+                }
+            }
+        }
+        #[test]
+        fn malformed_and_duplicate_properties_refuse_without_prepared_items() {
+            for clause in [
+                "(unlocked maybe)",
+                "(unlocked yes no)",
+                "(unlocked)",
+                "(unlocked yes) (unlocked no)",
+            ] {
+                let source = KICAD_LIBRARY_FOOTPRINT.replace(
+                    "(fp_text user \"${REFERENCE}\"",
+                    &format!("(fp_text user \"${{REFERENCE}}\" {clause}"),
+                );
+                assert!(
+                    parse_library_footprint("Test:Socket", &source).is_err(),
+                    "{clause}"
+                );
+            }
+            for clause in [
+                "(solder_mask_margin nope)",
+                "(solder_mask_margin 0 1)",
+                "(solder_mask_margin 2148)",
+                "(solder_mask_margin 0) (solder_mask_margin 0.1)",
+            ] {
+                let source = KICAD_LIBRARY_FOOTPRINT.replace(
+                    "(pad \"1\" smd rect",
+                    &format!("(pad \"1\" smd rect {clause}"),
+                );
+                assert!(
+                    parse_library_footprint("Test:Socket", &source).is_err(),
+                    "{clause}"
+                );
+            }
+            let source = legal_source().replace("(unlocked yes)", "(unlocked no)");
+            let library = parse_library_footprint("Test:Socket", &source).unwrap();
+            assert!(library.text_keep_upright.iter().all(|v| *v));
+        }
+        #[tokio::test]
+        async fn independent_readback_catches_mask_margin_loss_after_successful_write() {
+            let (temp, board, items) = plan_fixture();
+            std::fs::write(
+                temp.path().join("Test.pretty/Socket.kicad_mod"),
+                legal_source(),
+            )
+            .unwrap();
+            let mock = spawn_planner_mock_with_fault(&board, items[2].clone(), false, true);
+            let context = test_context(&mock.url);
+            let dry = handle_update_footprints_from_library(
+                &serde_json::json!({"board":board}),
+                &context,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result_json(&dry)["status"], "ready");
+            let request = serde_json::json!({"board":board,"dry_run":false,"expected_plan_revision":result_json(&dry)["plan_revision"]});
+            let response = handle_update_footprints_from_library(&request, &context)
+                .await
+                .unwrap();
+            let response = result_json(&response);
+            println!(
+                "MOCK_MCP_LIBRARY_EVIDENCE {}",
+                serde_json::json!({"request":request,"response":response,"source":"mock_kicad_ipc"})
+            );
+            assert_eq!(response["status"], "uncertain");
+            assert_eq!(response["error"]["kind"], "mutation_outcome_uncertain");
+            assert_eq!(response["coverage"]["changed"]["applied"], 0);
+            let capture = mock.capture.lock().unwrap();
+            assert_eq!(capture.update_batches, vec![1]);
+            assert_eq!(
+                capture.commit_actions,
+                vec![kiapi::common::commands::CommitAction::CmaCommit]
+            );
+        }
     }
 }

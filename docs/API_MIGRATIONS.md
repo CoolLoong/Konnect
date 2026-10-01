@@ -1710,3 +1710,11 @@ open, falling back to the saved file otherwise. Scoring policy and every existin
 field are unchanged; the response adds `source`, either `"ipc"` or `"saved_file"`
 (matching `run_drc`'s own source-disclosure convention), so a caller can tell
 which board state was judged.
+
+## Unreleased: footprint text orientation and pad mask overrides (minor release)
+
+`update_footprints_from_library` accepts typed `unlocked` text clauses and
+per-pad `solder_mask_margin`, retaining explicit zero. Apply now confirms the
+complete supported domains through independent IPC readback. Post-write failure
+returns an uncertain outcome rather than implying rollback. Arguments and filters
+are unchanged. See [the supported profile](FOOTPRINT_PROPERTY_PROFILE.md).
