@@ -3468,6 +3468,76 @@ impl KiCadIpcClient {
         })
     }
 
+    /// Native footprint flips in an explicit document. The caller owns the
+    /// commit and preflight. KiCad flips each footprint around its own anchor;
+    /// never substitute UpdateItems/layer reassignment for this operation.
+    /// Returned full native items are evidence to check against a fresh read.
+    pub fn flip_footprints_native_in(
+        &self,
+        document: kiapi::common::types::DocumentSpecifier,
+        ids: &[String],
+    ) -> Result<Vec<prost_types::Any>> {
+        anyhow::ensure!(
+            !ids.is_empty() && ids.iter().all(|id| !id.is_empty()),
+            "native flip requires nonempty footprint IDs"
+        );
+        let wanted = ids.iter().collect::<std::collections::BTreeSet<_>>();
+        anyhow::ensure!(wanted.len() == ids.len(), "duplicate flip UUID");
+        let header = header_for(document);
+        let command = kiapi::board::commands::FlipItems {
+            header: Some(header.clone()),
+            items: ids
+                .iter()
+                .map(|value| kiapi::common::types::Kiid {
+                    value: value.clone(),
+                })
+                .collect(),
+            direction: kiapi::board::commands::BoardFlipDirection::BfdTopBottom as i32,
+        };
+        let response: kiapi::board::commands::FlipItemsResponse = unpack_required(
+            self.send_command(&command, "kiapi.board.commands.FlipItems")?,
+            "FlipItems",
+        )?;
+        anyhow::ensure!(
+            response.header == Some(header),
+            "native flip response document mismatch"
+        );
+        anyhow::ensure!(
+            response.status == kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+            "native flip request rejected"
+        );
+        anyhow::ensure!(
+            response.flipped_items.len() == ids.len(),
+            "incomplete native flip results"
+        );
+        let mut observed = std::collections::BTreeSet::new();
+        let mut items = Vec::new();
+        for result in response.flipped_items {
+            let status = result.status.context("native flip result lacks status")?;
+            anyhow::ensure!(
+                status.code() == kiapi::common::commands::ItemStatusCode::IscOk,
+                "native flip failed: {}",
+                status.error_message
+            );
+            let item = result.item.context("native flip result lacks item")?;
+            anyhow::ensure!(
+                crate::builders::any_is(&item, "kiapi.board.types.FootprintInstance"),
+                "native flip returned a non-footprint"
+            );
+            let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+            let id = footprint
+                .id
+                .context("native flipped footprint lacks UUID")?
+                .value;
+            anyhow::ensure!(
+                wanted.contains(&id) && observed.insert(id),
+                "native flip UUID mismatch"
+            );
+            items.push(item);
+        }
+        Ok(items)
+    }
+
     /// Rotate a footprint to a new angle.
     pub fn rotate_footprint(&self, reference: &str, angle: f64) -> Result<()> {
         let items = self.get_items(kiapi::common::types::KiCadObjectType::KotPcbFootprint)?;

@@ -26,6 +26,7 @@ pub mod pcb_export;
 pub(crate) mod pcb_field_layout;
 pub(crate) mod pcb_footprint_update;
 pub(crate) mod pcb_live_snapshot;
+pub(crate) mod pcb_native_flip;
 pub mod pcb_routing;
 pub(crate) mod pcb_sync;
 mod placed_footprint_models;
