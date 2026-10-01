@@ -387,7 +387,7 @@ struct CliOutput {
 }
 
 /// Run a kicad-cli command with arguments and capture stdout.
-async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<String> {
+pub(crate) async fn run_cli(cli: &str, args: &[&str], timeout_dur: Duration) -> Result<String> {
     Ok(run_cli_captured(cli, args, timeout_dur).await?.stdout)
 }
 
@@ -1147,7 +1147,7 @@ fn enrich_drc_items(report: &mut DrcReport, board_source: &str) {
 
 /// Split out so it can be tested against a real `kicad-cli` report without
 /// running kicad-cli.
-fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
+pub(crate) fn parse_drc_report(raw: &serde_json::Value) -> Result<DrcReport> {
     fn category(raw: &serde_json::Value, key: &str) -> Option<Vec<DrcViolation>> {
         Some(
             raw.get(key)?

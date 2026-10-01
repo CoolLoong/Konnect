@@ -17,6 +17,7 @@ use tokio::task;
 
 pub fn tools() -> Vec<ToolDef> {
     vec![
+        super::custom_design_rules::tool(),
         tool!(
             "run_drc",
             "Run the Design Rule Check on the PCB and return structured violation results, \

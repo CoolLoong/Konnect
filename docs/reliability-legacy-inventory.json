@@ -4,7 +4,8 @@
     "add_schematic_component",
     "annotate_schematic",
     "batch_place_components",
-    "run_design_review"
+    "run_design_review",
+    "set_custom_design_rule"
   ],
   "legacy_entry_ceiling": 3,
   "legacy_entries": [

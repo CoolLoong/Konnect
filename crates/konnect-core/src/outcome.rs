@@ -19,6 +19,7 @@ pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
     "annotate_schematic",
     "batch_place_components",
     "run_design_review",
+    "set_custom_design_rule",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
