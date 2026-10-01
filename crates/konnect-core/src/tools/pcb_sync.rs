@@ -5426,6 +5426,24 @@ mod schematic_fields_tests {
         );
     }
     #[test]
+    fn library_refresh_after_schematic_sync_keeps_mpn_bom_and_native_identity() {
+        let mut before = captured_footprint();
+        let wanted = SchematicFields {
+            exclude_from_bom: true,
+            fields: BTreeMap::from([("MPN".to_owned(), "MFR-42".to_owned())]),
+        };
+        sync_schematic_fields(&mut before, &wanted).unwrap();
+        let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
+        let after =
+            super::pcb_footprint_update::refresh_for_integration_test(&before, source).unwrap();
+        let observed = read_schematic_fields(&after).unwrap();
+        assert!(observed.exclude_from_bom);
+        assert_eq!(observed.fields["MPN"], "MFR-42");
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.symbol_path, before.symbol_path);
+        assert_eq!(after.position, before.position);
+    }
+    #[test]
     fn independent_field_readback_detects_missing_changed_duplicate_and_wrong_uuid() {
         let dir = tempfile::tempdir().unwrap();
         let board = dir.path().join("test.kicad_pcb");

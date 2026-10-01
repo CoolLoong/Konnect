@@ -4435,3 +4435,16 @@ mod tests {
         }
     }
 }
+
+// Test-only bridge for the cross-tool synchronization/refresh contract.
+#[cfg(test)]
+pub(crate) fn refresh_for_integration_test(
+    current: &kiapi::board::types::FootprintInstance,
+    source: &str,
+) -> Result<kiapi::board::types::FootprintInstance> {
+    let library = parse_library_footprint("Capacitor_SMD:C_0603_1608Metric", source)?;
+    let prepared = build_updated_instance(current, &library, &BTreeMap::new(), &BTreeSet::new())?;
+    Ok(kiapi::board::types::FootprintInstance::decode(
+        prepared.item.value.as_slice(),
+    )?)
+}
