@@ -1147,6 +1147,13 @@ async fn handle_batch_edit(
     args: &serde_json::Value,
     _ctx: &crate::tools::ToolContext,
 ) -> anyhow::Result<CallToolResult> {
+    handle_batch_edit_observed(args, |_| {}).await
+}
+
+async fn handle_batch_edit_observed(
+    args: &serde_json::Value,
+    after_write: impl FnOnce(&std::path::Path) + Send,
+) -> anyhow::Result<CallToolResult> {
     let sch_path = get_path(args, "schematic")?;
     let edits_arr = match args["edits"].as_array() {
         Some(a) => a.clone(),
@@ -1160,6 +1167,11 @@ async fn handle_batch_edit(
     };
 
     let expected = read_consistent(&sch_path)?;
+    if let Err(error) = super::schematic_property_integrity::parse(&expected) {
+        return Ok(CallToolResult::error(format!(
+            "Invalid schematic before batch field update; nothing written: {error:#}"
+        )));
+    }
     let mut content = expected.clone();
     let mut changed: Vec<serde_json::Value> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -1277,9 +1289,37 @@ async fn handle_batch_edit(
         }
     }
 
-    write_atomic_if_unchanged(&sch_path, &expected, &content)?;
-
+    if let Err(error) = super::schematic_property_integrity::verify(&expected, &content, &changed) {
+        let mut result = CallToolResult::json(
+            &json!({"status":"refused", "updated_count":0,"updated_unit_copies":0,"created_unit_copies":0,"updated":[],"errors":[format!("Candidate structural/field validation failed; nothing written: {error:#}")],"applied":false}),
+        );
+        result.is_error = true;
+        return Ok(result);
+    }
+    if content != expected {
+        write_atomic_if_unchanged(&sch_path, &expected, &content)?;
+    }
+    after_write(&sch_path);
+    let readback = read_consistent(&sch_path);
+    if let Err(error) = readback.and_then(|after| {
+        if after != content {
+            return Err(konnect_sexp::SexpError::InvalidValue(
+                "batch field readback differs".into(),
+            ));
+        }
+        super::schematic_property_integrity::verify(&expected, &after, &changed)
+            .map_err(|e| konnect_sexp::SexpError::InvalidValue(format!("{e:#}")))
+    }) {
+        let mut result = CallToolResult::json(
+            &json!({"status":"uncertain","potentially_applied":content != expected,"updated_count":0,"updated_unit_copies":0,"created_unit_copies":0,"updated":[],"attempted_updates":changed,"errors":[error.to_string()],"recovery":"Inspect saved schematic before retrying; do not assume rollback."}),
+        );
+        result.is_error = true;
+        return Ok(result);
+    }
     Ok(CallToolResult::json(&json!({
+        "status": if errors.is_empty() { "complete" } else if changed.is_empty() { "refused" } else { "partial" },
+        "structure_verified":true,
+        "fields_readback_verified":true,
         "updated_count": changed.len(),
         "updated_unit_copies": updated_unit_copies,
         "created_unit_copies": created_unit_copies,
@@ -3216,6 +3256,61 @@ mod multi_unit_handler_tests {
         assert_eq!(result["created_unit_copies"], 0);
         assert_eq!(result["updated"][0]["fields"][0]["updated_units"], 3);
         assert_eq!(result["updated"][0]["fields"][1]["updated_units"], 3);
+    }
+
+    #[tokio::test]
+    async fn compact_authored_symbols_create_several_properties_without_nesting() {
+        // Formatting-only variant of the real KiCad-authored ECC83 fixture.
+        // It retains the exact AST, every UUID, wire, pin and component pose.
+        let compact = ECC83.lines().map(str::trim).collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            super::super::schematic_property_integrity::parse(&compact).unwrap(),
+            super::super::schematic_property_integrity::parse(ECC83).unwrap()
+        );
+        for source in [compact, ECC83.replace('\n', "\r\n")] {
+            let schematic = fixture_file();
+            std::fs::write(schematic.path(), &source).unwrap();
+            let result = call(schematic.path(),"batch_edit_schematic_components",json!({"create_missing":true,"edits":[{"reference":"U1","fields":{"Manufacturer":"Test Maker","Nominal Specification":"exact variant","Specification":"quoted \"text\" and \\path"}}]})).await;
+            assert_eq!(result["created_unit_copies"], 9, "{result}");
+            assert_eq!(result["errors"], json!([]));
+            assert_eq!(result["structure_verified"], true);
+            assert_eq!(result["fields_readback_verified"], true);
+            let after = std::fs::read_to_string(schematic.path()).unwrap();
+            assert_eq!(
+                instances(schematic.path()).len(),
+                extract_symbol_instances(&konnect_sexp::parse_sexp(&source).unwrap()).len()
+            );
+            super::super::schematic_property_integrity::verify(
+                &source,
+                &after,
+                result["updated"].as_array().unwrap(),
+            )
+            .unwrap();
+            let repeated = call(schematic.path(),"batch_edit_schematic_components",json!({"create_missing":true,"edits":[{"reference":"U1","fields":{"Manufacturer":"Test Maker"}}]})).await;
+            assert_eq!(repeated["created_unit_copies"], 0);
+            assert_eq!(std::fs::read_to_string(schematic.path()).unwrap(), after);
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_field_readback_loss_is_uncertain_with_zero_confirmed_counts() {
+        let schematic = fixture_file();
+        let args =
+            json!({"schematic":schematic.path(),"edits":[{"reference":"U1","value":"NEW VALUE"}]});
+        let result = handle_batch_edit_observed(&args, |path| {
+            let source = std::fs::read_to_string(path).unwrap();
+            std::fs::write(path, source.replace("NEW VALUE", "UNEXPECTED VALUE")).unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let crate::mcp::protocol::ToolContent::Text { text } = &result.content[0] else {
+            panic!("text");
+        };
+        let body: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(body["status"], "uncertain");
+        assert_eq!(body["updated_unit_copies"], 0);
+        assert!(body["potentially_applied"].as_bool().unwrap());
     }
 
     #[tokio::test]
