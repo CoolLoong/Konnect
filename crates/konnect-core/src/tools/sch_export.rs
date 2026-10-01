@@ -1644,7 +1644,11 @@ mod tests {
         assert!(names.contains(&"render_schematic_png"), "{names:?}");
         assert!(names.contains(&"set_visual_baseline"), "{names:?}");
         assert!(names.contains(&"compare_visual_baseline"), "{names:?}");
-        assert_eq!(names.len(), 10, "sch_export tool count");
+        assert!(
+            names.contains(&"relink_pcb_footprint_to_schematic"),
+            "{names:?}"
+        );
+        assert_eq!(names.len(), 11, "sch_export tool count");
     }
 
     #[tokio::test]
