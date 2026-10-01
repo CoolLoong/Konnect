@@ -805,7 +805,10 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             if old_net == new_net {
                 continue;
             }
-            if board.routed_nets.contains_key(old_net) || board.routed_nets.contains_key(new_net) {
+            // Protect copper already assigned to the pad's OLD net. An
+            // unrouted pad joining an existing destination net changes no
+            // copper and must not be blocked merely because that net is routed.
+            if board.routed_nets.contains_key(old_net) {
                 diagnostics.push(conflict(
                     "routed_pad_net_change",
                     format!(
@@ -3525,6 +3528,71 @@ mod tests {
         assert_eq!(plan.status, PlanStatus::Noop);
         assert!(plan.changes.is_empty());
         assert_eq!(plan.counts.conflicts.planned, 0);
+    }
+
+    #[test]
+    fn an_unrouted_pad_can_join_a_routed_destination_net_but_old_copper_still_blocks() {
+        use konnect_ipc::gen::kiapi;
+        use konnect_ipc::gen::kiapi::board::types::Zone;
+        let mut footprint = board_resistor("R1", Some("/sheet/existing"));
+        footprint.pad_nets.insert("1".into(), "OLD_VCC".into());
+        let mut board = board_with(vec![footprint]);
+        let mut design = parse_exported_netlist(ONE_RESISTOR).unwrap();
+        design.components = vec![resistor("R1", "/sheet/existing")];
+        // A native name-only net is evidence for exactly its named net. The
+        // destination's existing tracks/arcs/vias are not old-pad copper.
+        record_routed_net(
+            &mut board.routed_nets,
+            Some(&kiapi::board::types::Net {
+                name: "VCC".into(),
+                code: None,
+            }),
+        );
+        let permitted = plan_sync("export", &design, &board);
+        assert_eq!(permitted.status, PlanStatus::Ready);
+        assert_eq!(permitted.counts.pads_reassigned.planned, 1);
+        // Joining a destination copper zone has the same safe semantics.
+        let mut zone = Zone::decode(
+            include_bytes!("../../tests/fixtures/issue_474_copper_zone_0.ipc.bin").as_slice(),
+        )
+        .unwrap();
+        let Some(kiapi::board::types::zone::Settings::CopperSettings(settings)) =
+            &mut zone.settings
+        else {
+            panic!("copper zone");
+        };
+        settings.net.as_mut().unwrap().name = "VCC".into();
+        record_zone_nets(
+            &mut board.routed_nets,
+            &[konnect_ipc::builders::pack_any(
+                &zone,
+                "kiapi.board.types.Zone",
+            )],
+            &BTreeMap::from([("VCC".into(), 1)]),
+        )
+        .unwrap();
+        assert_eq!(
+            plan_sync("export", &design, &board).status,
+            PlanStatus::Ready
+        );
+        for old in ["OLD_VCC", ""] {
+            board.footprints[0].pad_nets.insert("1".into(), old.into());
+            assert_eq!(
+                plan_sync("export", &design, &board).status,
+                PlanStatus::Ready
+            );
+        }
+        board.footprints[0]
+            .pad_nets
+            .insert("1".into(), "OLD_VCC".into());
+        board.routed_nets.insert("OLD_VCC".into(), 1);
+        let protected = plan_sync("export", &design, &board);
+        assert_eq!(protected.status, PlanStatus::Conflict);
+        assert!(protected.changes.is_empty());
+        assert!(protected
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "routed_pad_net_change"));
     }
 
     #[test]
