@@ -335,7 +335,12 @@ fn plan(source: &str, request: &Request) -> Result<Plan> {
             block = patch(&block, "layer", "loss_tangent", &value.to_string())?;
         }
         let (a, b) = range.unwrap_or((stack.len() - 1, stack.len() - 1));
-        stack = format!("{}\n{}\n{}", &stack[..a], block, &stack[b..]);
+        let replacement = if range.is_none() {
+            format!("\n{block}\n")
+        } else {
+            block
+        };
+        stack = format!("{}{}{}", &stack[..a], replacement, &stack[b..]);
     }
     let next_setup = patch(setup, "setup", "stackup", "")?;
     // Replace the complete stackup block, preserving every byte outside it.

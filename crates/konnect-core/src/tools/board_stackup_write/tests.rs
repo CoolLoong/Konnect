@@ -48,6 +48,11 @@ fn ctx(ipc: String, cli: String) -> ToolContext {
 fn stackup_plan_preserves_all_objects_and_unrequested_properties() {
     let r = request(&args(Path::new("board"))).unwrap();
     let p = plan(BOARD, &r).unwrap();
+    assert_eq!(
+        plan(&p.candidate, &r).unwrap().candidate,
+        p.candidate,
+        "a repeated exact request must not grow whitespace or plan another write"
+    );
     assert!(p.candidate.contains("(thickness 1.59)"));
     assert!(p.candidate.contains("(future \"preserve\")"));
     assert!(p.candidate.contains("(segment (start 1 2) (end 3 4)"));
@@ -64,6 +69,10 @@ fn stackup_plan_preserves_all_objects_and_unrequested_properties() {
     changed.layers[1].epsilon_r = None;
     changed.board_thickness_mm = None;
     let edited = plan(&source, &changed).unwrap();
+    assert_eq!(
+        plan(&edited.candidate, &changed).unwrap().candidate,
+        edited.candidate
+    );
     assert!(edited.candidate.contains("(epsilon_r 4.6)"));
     assert!(edited.candidate.contains("(color \"unknown\")"));
     assert!(edited.candidate.contains("(future_layer_setting yes)"));
