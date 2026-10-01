@@ -1723,7 +1723,8 @@ which board state was judged.
 ## Unreleased: footprint text orientation and pad mask overrides (minor release)
 
 `update_footprints_from_library` accepts typed `unlocked` text clauses and
-per-pad `solder_mask_margin`, retaining explicit zero. Apply now confirms the
+per-pad `solder_mask_margin`, retaining explicit zero. Schematic-linked footprints
+retain their placed BOM exclusion during library refresh. Apply now confirms the
 complete supported domains through independent IPC readback. Post-write failure
 returns an uncertain outcome rather than implying rollback. Arguments and filters
 are unchanged. See [the supported profile](FOOTPRINT_PROPERTY_PROFILE.md).
