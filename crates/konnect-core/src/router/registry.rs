@@ -78,13 +78,13 @@ pub static ALL_TOOLSETS: &[ToolsetMeta] = &[
         name: "pcb_board",
         description: "Board outline, layers, zones, mounting holes, board text, SVG logo import",
         category: "pcb",
-        tool_count: 13,
+        tool_count: 14,
     },
     ToolsetMeta {
         name: "pcb_components",
         description: "Place, refresh, move, rotate, flip, align, duplicate and repair PCB footprints; inspect pads; inspect and edit a placed footprint's graphics",
         category: "pcb",
-        tool_count: 21,
+        tool_count: 20,
     },
     ToolsetMeta {
         name: "pcb_routing",

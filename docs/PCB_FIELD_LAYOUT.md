@@ -1,6 +1,6 @@
 # Placed Reference/Value layout
 
-`edit_footprint_field_layout` in `pcb_components` previews or applies a batch
+`edit_footprint_field_layout` in `pcb_board` previews or applies a batch
 of instance field layout edits over native IPC. Every entry binds an exact
 footprint UUID and reference and selects `Reference` or `Value`. Optional
 `position: {x,y}` uses absolute board millimeters; `angle_deg` uses absolute
