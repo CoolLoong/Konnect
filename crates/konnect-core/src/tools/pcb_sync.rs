@@ -63,6 +63,12 @@ struct SkippedComponent {
     symbol_path: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct SchematicFields {
+    exclude_from_bom: bool,
+    fields: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DesignComponent {
     reference: String,
@@ -70,6 +76,7 @@ struct DesignComponent {
     footprint_id: String,
     symbol_path: String,
     dnp: bool,
+    schematic_fields: SchematicFields,
     pad_nets: BTreeMap<String, String>,
 }
 
@@ -104,6 +111,7 @@ struct BoardFootprint {
     locked: bool,
     dnp: bool,
     not_in_schematic: bool,
+    schematic_fields: SchematicFields,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -140,6 +148,7 @@ struct SyncCounts {
     /// planned, never fatal (#507).
     unassigned_footprint: CountPair,
     conflicts: CountPair,
+    fields_synchronized: CountPair,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -159,6 +168,7 @@ enum PlannedChange {
         footprint_id: String,
         symbol_path: String,
         dnp: bool,
+        schematic_fields: SchematicFields,
         pad_nets: BTreeMap<String, String>,
         position: Point,
     },
@@ -168,6 +178,7 @@ enum PlannedChange {
         value: String,
         symbol_path: String,
         dnp: bool,
+        schematic_fields: SchematicFields,
         pad_nets: BTreeMap<String, String>,
         preserve: PreservedBoardState,
     },
@@ -345,13 +356,23 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             let (creates, updates) = build_mutation_items(&plan, &prepared, &snapshot)?;
             // What we are about to send, so the board can be held to it.
             let expected = footprint_shapes(creates.iter().chain(updates.iter()));
-            client.run_commit("Update PCB from saved schematic", |client| {
+            let expected_fields = creates.iter().chain(updates.iter()).cloned().collect::<Vec<_>>();
+            let mutation = client.run_commit("Update PCB from saved schematic", |client| {
                 client.create_items_in(snapshot.document.clone(), creates)?;
                 client.update_items_in(snapshot.document.clone(), updates)?;
                 Ok(())
-            })?;
-            for detail in verify_board_matches_what_was_sent(client, &snapshot.document, &expected)?
-            {
+            });
+            let verification = mutation.and_then(|()| verify_schematic_fields(client, &snapshot.document, &expected_fields, &plan.changes));
+            let fields_verified = match verification {
+                Ok(count) => count,
+                Err(error) => return Ok(sync_uncertain_response(&plan, hierarchy.len(), &ipc_board, format!("{error:#}"))),
+            };
+            let shape_verification = verify_board_matches_what_was_sent(client, &snapshot.document, &expected);
+            let details = match shape_verification {
+                Ok(details) => details,
+                Err(error) => return Ok(sync_uncertain_response(&plan, hierarchy.len(), &ipc_board, format!("{error:#}"))),
+            };
+            for detail in details {
                 plan.diagnostics.push(conflict(
                     "board_readback_differs",
                     format!(
@@ -362,6 +383,7 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                     None,
                 ));
             }
+            plan.counts.fields_synchronized.applied = fields_verified;
             plan.counts.added.applied = plan.counts.added.planned;
             plan.counts.updated.applied = plan.counts.updated.planned;
             plan.counts.pads_reassigned.applied = plan.counts.pads_reassigned.planned;
@@ -395,6 +417,24 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     })
 }
 
+fn sync_uncertain_response(
+    plan: &SyncPlan,
+    hierarchy_files: usize,
+    board: &Path,
+    reason: String,
+) -> CallToolResult {
+    let mut result = sync_response(plan, "uncertain", hierarchy_files, false);
+    result.is_error = true;
+    if let Some(ToolContent::Text { text }) = result.content.first_mut() {
+        let mut body: serde_json::Value =
+            serde_json::from_str(text).expect("sync response is JSON");
+        body["error"] = serde_json::json!({"kind":"mutation_outcome_uncertain", "operation":"update_pcb_from_schematic", "path":board, "reason":reason});
+        body["recovery"] = serde_json::json!("Inspect the live board before retrying; the commit may have applied. Do not assume rollback or save automatically.");
+        *text = body.to_string();
+    }
+    result
+}
+
 fn sync_response(
     plan: &SyncPlan,
     status: &str,
@@ -415,6 +455,7 @@ fn sync_response(
             "board_only_preserved": plan.counts.board_only_preserved,
             "skipped_by_flag": plan.counts.skipped_by_flag,
             "unassigned_footprint": plan.counts.unassigned_footprint,
+            "fields_synchronized": plan.counts.fields_synchronized,
             "conflicts": plan.counts.conflicts
         },
         "changes": plan.changes,
@@ -675,10 +716,12 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 footprint_id: component.footprint_id.clone(),
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
+                schematic_fields: component.schematic_fields.clone(),
                 pad_nets: component.pad_nets.clone(),
                 position,
             });
             counts.added.planned += 1;
+            counts.fields_synchronized.planned += component.schematic_fields.fields.len();
             continue;
         };
 
@@ -765,6 +808,13 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             || footprint.value != component.value
             || footprint.symbol_path.as_deref() != Some(component.symbol_path.as_str())
             || footprint.dnp != component.dnp
+            || footprint.schematic_fields.exclude_from_bom
+                != component.schematic_fields.exclude_from_bom
+            || component
+                .schematic_fields
+                .fields
+                .iter()
+                .any(|(name, value)| footprint.schematic_fields.fields.get(name) != Some(value))
             || changed_pads > 0;
         if needs_update {
             changes.push(PlannedChange::Update {
@@ -773,6 +823,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 value: component.value.clone(),
                 symbol_path: component.symbol_path.clone(),
                 dnp: component.dnp,
+                schematic_fields: component.schematic_fields.clone(),
                 pad_nets: component.pad_nets.clone(),
                 preserve: PreservedBoardState {
                     position: footprint.position,
@@ -782,6 +833,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
                 },
             });
             counts.updated.planned += 1;
+            counts.fields_synchronized.planned += component.schematic_fields.fields.len();
             counts.pads_reassigned.planned += changed_pads;
         }
     }
@@ -793,6 +845,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
         counts.added.planned = 0;
         counts.updated.planned = 0;
         counts.pads_reassigned.planned = 0;
+        counts.fields_synchronized.planned = 0;
     }
     let status = if !diagnostics.is_empty() {
         PlanStatus::Conflict
@@ -957,6 +1010,7 @@ fn plan_revision(netlist_source: &str, board: &BoardState) -> String {
         hasher.update(footprint.reference.as_bytes());
         hasher.update(footprint.footprint_id.as_bytes());
         hasher.update(footprint.symbol_path.as_deref().unwrap_or("").as_bytes());
+        hasher.update(serde_json::to_vec(&footprint.schematic_fields).expect("fields serialize"));
         for (pad, net) in &footprint.pad_nets {
             hasher.update(pad.as_bytes());
             hasher.update(net.as_bytes());
@@ -1050,6 +1104,7 @@ fn parse_exported_netlist(source: &str) -> Result<ExportedDesign> {
             footprint_id,
             symbol_path,
             dnp,
+            schematic_fields: parse_schematic_fields(component_node)?,
             pad_nets: BTreeMap::new(),
         });
     }
@@ -1097,6 +1152,262 @@ fn required_value(node: &SexpNode, tag: &str) -> Result<String> {
         .with_context(|| format!("KiCad netlist node is missing {tag}"))
 }
 
+fn parse_schematic_fields(component: &SexpNode) -> Result<SchematicFields> {
+    let mut fields = BTreeMap::new();
+    anyhow::ensure!(
+        component.find_all("fields").len() <= 1,
+        "duplicate exported fields sections"
+    );
+    if let Some(exported) = component.find("fields") {
+        for field in exported.find_all("field") {
+            let name = required_value(field, "name")?;
+            if matches!(
+                name.as_str(),
+                "Reference" | "Value" | "Footprint" | "Component Class"
+            ) {
+                continue;
+            }
+            let value = field
+                .children()
+                .unwrap_or_default()
+                .iter()
+                .skip(1)
+                .find_map(SexpNode::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if fields.insert(name.clone(), value).is_some() {
+                bail!("component has duplicate exported field '{name}'");
+            }
+        }
+    }
+    Ok(SchematicFields {
+        exclude_from_bom: component
+            .find_all("property")
+            .iter()
+            .any(|property| property.find_str("name") == Some("exclude_from_bom")),
+        fields,
+    })
+}
+
+fn read_schematic_fields(
+    footprint: &konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+) -> Result<SchematicFields> {
+    use konnect_ipc::gen::kiapi;
+    let definition = footprint
+        .definition
+        .as_ref()
+        .context("footprint has no definition")?;
+    let mut fields = BTreeMap::new();
+    for field in [&footprint.datasheet_field, &footprint.description_field]
+        .into_iter()
+        .flatten()
+    {
+        fields.insert(field.name.clone(), field_text(&Some(field.clone())));
+    }
+    for item in &definition.items {
+        if !konnect_ipc::builders::any_is(item, "kiapi.board.types.Field") {
+            continue;
+        }
+        let field = kiapi::board::types::Field::decode(item.value.as_slice())?;
+        if field.name.is_empty()
+            || field
+                .text
+                .as_ref()
+                .and_then(|text| text.text.as_ref())
+                .is_none()
+        {
+            bail!("footprint has incomplete custom field evidence");
+        }
+        if fields
+            .insert(field.name.clone(), field_text(&Some(field)))
+            .is_some()
+        {
+            bail!("footprint has duplicate custom field names");
+        }
+    }
+    Ok(SchematicFields {
+        exclude_from_bom: footprint
+            .attributes
+            .as_ref()
+            .is_some_and(|a| a.exclude_from_bill_of_materials),
+        fields,
+    })
+}
+
+fn new_schematic_field(
+    template: &Option<konnect_ipc::gen::kiapi::board::types::Field>,
+    position: Option<konnect_ipc::gen::kiapi::common::types::Vector2>,
+    name: &str,
+    value: &str,
+) -> konnect_ipc::gen::kiapi::board::types::Field {
+    use konnect_ipc::gen::kiapi;
+    let mut field = template.clone().unwrap_or_default();
+    field.id = None; // A mandatory target retains its native ID; new children default to user fields.
+    field.name = name.to_owned();
+    field.visible = false;
+    let text = field.text.get_or_insert_with(Default::default);
+    text.id = Some(kiapi::common::types::Kiid {
+        value: uuid::Uuid::new_v4().to_string(),
+    });
+    text.parent = None;
+    text.layer = kiapi::board::types::BoardLayer::BlFFab as i32;
+    let contents = text.text.get_or_insert_with(Default::default);
+    contents.text = value.to_owned();
+    contents.position = position;
+    let attributes = contents.attributes.get_or_insert_with(Default::default);
+    attributes
+        .size
+        .get_or_insert(konnect_ipc::builders::vec2(1.0, 1.0));
+    attributes.keep_upright = true;
+    field
+}
+
+fn sync_schematic_fields(
+    footprint: &mut konnect_ipc::gen::kiapi::board::types::FootprintInstance,
+    expected: &SchematicFields,
+) -> Result<()> {
+    use konnect_ipc::gen::kiapi;
+    // Validate all existing field evidence before replacing a parent footprint.
+    read_schematic_fields(footprint)?;
+    let template = footprint.value_field.clone();
+    let position = footprint.position;
+    footprint
+        .attributes
+        .get_or_insert_with(Default::default)
+        .exclude_from_bill_of_materials = expected.exclude_from_bom;
+    for (name, value) in &expected.fields {
+        let mandatory = match name.as_str() {
+            "Datasheet" => Some(&mut footprint.datasheet_field),
+            "Description" => Some(&mut footprint.description_field),
+            _ => None,
+        };
+        if let Some(field) = mandatory {
+            if field.is_none() {
+                *field = Some(new_schematic_field(&template, position, name, value));
+            }
+            set_field_text(field, name, value);
+        }
+    }
+    let definition = footprint
+        .definition
+        .as_mut()
+        .context("footprint has no definition")?;
+    definition
+        .attributes
+        .get_or_insert_with(Default::default)
+        .exclude_from_bill_of_materials = expected.exclude_from_bom;
+    definition.datasheet_field = footprint.datasheet_field.clone();
+    definition.description_field = footprint.description_field.clone();
+    for (name, value) in &expected.fields {
+        if matches!(name.as_str(), "Datasheet" | "Description") {
+            continue;
+        }
+        let mut found = false;
+        for item in &mut definition.items {
+            if !konnect_ipc::builders::any_is(item, "kiapi.board.types.Field") {
+                continue;
+            }
+            let field = kiapi::board::types::Field::decode(item.value.as_slice())?;
+            if field.name != *name {
+                continue;
+            }
+            anyhow::ensure!(
+                field.encode_to_vec() == item.value,
+                "custom field '{name}' contains unmodeled protobuf data"
+            );
+            let mut field = Some(field);
+            set_field_text(&mut field, name, value);
+            *item = konnect_ipc::builders::pack_any(
+                &field.context("missing updated field")?,
+                "kiapi.board.types.Field",
+            );
+            found = true;
+        }
+        if !found {
+            let field = new_schematic_field(&template, position, name, value);
+            definition.items.push(konnect_ipc::builders::pack_any(
+                &field,
+                "kiapi.board.types.Field",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The complete annotations of every changed footprint, independently read
+/// from KiCad after the commit. Board-only fields must survive as well.
+fn verify_schematic_fields(
+    client: &konnect_ipc::KiCadIpcClient,
+    document: &konnect_ipc::gen::kiapi::common::types::DocumentSpecifier,
+    expected: &[prost_types::Any],
+    changes: &[PlannedChange],
+) -> Result<usize> {
+    use konnect_ipc::gen::kiapi;
+    let items = client.get_items_in(
+        document.clone(),
+        kiapi::common::types::KiCadObjectType::KotPcbFootprint,
+    )?;
+    let expected_references = expected
+        .iter()
+        .map(|item| {
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice())
+                .map(|fp| field_text(&fp.reference_field))
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let mut observed = BTreeMap::new();
+    for item in items {
+        anyhow::ensure!(
+            konnect_ipc::builders::any_is(&item, "kiapi.board.types.FootprintInstance"),
+            "wrong footprint Any type in readback"
+        );
+        let footprint = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+        let reference = field_text(&footprint.reference_field);
+        if !expected_references.contains(&reference) {
+            continue;
+        }
+        anyhow::ensure!(
+            observed.insert(reference, footprint).is_none(),
+            "duplicate footprint reference in readback"
+        );
+    }
+    let mut verified = 0;
+    for item in expected {
+        let sent = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+        let reference = field_text(&sent.reference_field);
+        let after = observed
+            .get(&reference)
+            .with_context(|| format!("footprint '{reference}' missing from annotation readback"))?;
+        if sent.id.is_some() {
+            anyhow::ensure!(after.id == sent.id, "footprint '{reference}' UUID changed");
+        }
+        let wanted = read_schematic_fields(&sent)?;
+        let got = read_schematic_fields(after)?;
+        anyhow::ensure!(got == wanted, "footprint '{reference}' field/BOM readback differs: expected {wanted:?}, observed {got:?}");
+        let names = changes
+            .iter()
+            .find_map(|change| match change {
+                PlannedChange::Add {
+                    reference: planned,
+                    schematic_fields,
+                    ..
+                }
+                | PlannedChange::Update {
+                    reference: planned,
+                    schematic_fields,
+                    ..
+                } if planned == &reference => Some(&schematic_fields.fields),
+                _ => None,
+            })
+            .context("readback footprint missing from sync plan")?;
+        verified += got
+            .fields
+            .keys()
+            .filter(|name| names.contains_key(*name))
+            .count();
+    }
+    Ok(verified)
+}
+
 fn update_footprint_item(
     item: &prost_types::Any,
     change: &PlannedChange,
@@ -1111,6 +1422,7 @@ fn update_footprint_item(
         value,
         symbol_path,
         dnp,
+        schematic_fields,
         pad_nets,
         ..
     } = change
@@ -1129,6 +1441,7 @@ fn update_footprint_item(
         value,
         symbol_path,
         *dnp,
+        schematic_fields,
         pad_nets,
         net_codes,
     )?;
@@ -1146,6 +1459,7 @@ fn apply_footprint_fields(
     value: &str,
     symbol_path: &str,
     dnp: bool,
+    schematic_fields: &SchematicFields,
     pad_nets: &BTreeMap<String, String>,
     net_codes: &BTreeMap<String, i32>,
 ) -> Result<()> {
@@ -1179,6 +1493,11 @@ fn apply_footprint_fields(
         .get_or_insert_with(Default::default)
         .do_not_populate = dnp;
 
+    sync_schematic_fields(footprint, schematic_fields)?;
+    let definition = footprint
+        .definition
+        .as_mut()
+        .context("missing footprint definition")?;
     let mut seen_pads = std::collections::HashSet::new();
     for child in &mut definition.items {
         // `definition.items` mixes pads, graphics and text in one repeated
@@ -1480,9 +1799,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -1491,11 +1807,10 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
             return false;
         }
         component.dnp = entry.dnp;
+        component.schematic_fields.exclude_from_bom = !entry.in_bom;
         true
     });
-    // The same flags govern a component with no footprint: excluded from the
-    // BOM it is dropped, excluded from the board it is skipped by flag rather
-    // than reported as unassigned.
+    // Board inclusion is independent of BOM inclusion, including unassigned parts.
     design.unassigned.retain(|component| {
         let path_match = flags
             .iter()
@@ -1508,9 +1823,6 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         let Some(entry) = entry else {
             return true;
         };
-        if !entry.in_bom {
-            return false;
-        }
         if !entry.on_board {
             design.skipped.push(SkippedComponent {
                 reference: entry.reference.clone(),
@@ -1521,7 +1833,7 @@ fn apply_saved_symbol_flags(files: &[PathBuf], design: &mut ExportedDesign) -> R
         true
     });
     let mut skipped_references = HashSet::new();
-    for entry in flags.iter().filter(|entry| entry.in_bom && !entry.on_board) {
+    for entry in flags.iter().filter(|entry| !entry.on_board) {
         if !skipped_references.insert(entry.reference.as_str()) {
             continue;
         }
@@ -1689,6 +2001,7 @@ fn board_footprint_from_instance(
             .as_ref()
             .map(|attributes| attributes.do_not_populate)
             .unwrap_or(false),
+        schematic_fields: read_schematic_fields(footprint)?,
         not_in_schematic: footprint
             .attributes
             .as_ref()
@@ -2008,6 +2321,7 @@ fn build_mutation_items(
                 footprint_id,
                 symbol_path,
                 dnp,
+                schematic_fields,
                 pad_nets,
                 position,
             } => {
@@ -2034,6 +2348,7 @@ fn build_mutation_items(
                     value,
                     symbol_path,
                     *dnp,
+                    schematic_fields,
                     pad_nets,
                     &snapshot.net_codes,
                 )?;
@@ -2308,6 +2623,7 @@ mod tests {
             footprint_id: "Resistor_SMD:R_0603_1608Metric".to_string(),
             symbol_path: symbol_path.to_string(),
             dnp: false,
+            schematic_fields: SchematicFields::default(),
             pad_nets: BTreeMap::from([
                 ("1".to_string(), "VCC".to_string()),
                 ("2".to_string(), "GND".to_string()),
@@ -2332,6 +2648,7 @@ mod tests {
             layer: "F.Cu".to_string(),
             locked: false,
             dnp: false,
+            schematic_fields: SchematicFields::default(),
             not_in_schematic: false,
         }
     }
@@ -2377,6 +2694,7 @@ mod tests {
                     layer: "B.Cu".to_string(),
                     locked: true,
                     dnp: false,
+                    schematic_fields: SchematicFields::default(),
                     not_in_schematic: false,
                 },
                 BoardFootprint {
@@ -2392,6 +2710,7 @@ mod tests {
                     layer: "F.Cu".to_string(),
                     locked: true,
                     dnp: false,
+                    schematic_fields: SchematicFields::default(),
                     not_in_schematic: true,
                 },
             ],
@@ -2558,6 +2877,7 @@ mod tests {
             value: "NE555".to_string(),
             symbol_path: "/root/u1".to_string(),
             dnp: false,
+            schematic_fields: SchematicFields::default(),
             pad_nets: BTreeMap::from([("1".to_string(), "GND".to_string())]),
             preserve: PreservedBoardState {
                 position: Point { x: 25.0, y: 30.0 },
@@ -2609,6 +2929,7 @@ mod tests {
             "NE555",
             "/root/u2",
             false,
+            &SchematicFields::default(),
             &BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             &BTreeMap::from([("VCC".to_string(), 3)]),
         )
@@ -2697,6 +3018,7 @@ mod tests {
             "NE555",
             "/root/u3",
             false,
+            &SchematicFields::default(),
             &BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             &BTreeMap::new(),
         )
@@ -2754,6 +3076,7 @@ mod tests {
             value: "10k".to_string(),
             symbol_path: "/root/symbol".to_string(),
             dnp: true,
+            schematic_fields: SchematicFields::default(),
             pad_nets: BTreeMap::from([("1".to_string(), "VCC".to_string())]),
             preserve: PreservedBoardState {
                 position: Point { x: 25.0, y: 30.0 },
@@ -2811,6 +3134,7 @@ mod tests {
                 layer: "F.Cu".to_string(),
                 locked: false,
                 dnp: false,
+                schematic_fields: SchematicFields::default(),
                 not_in_schematic: false,
             }],
             routed_nets: BTreeMap::from([("VCC".to_string(), 1)]),
@@ -3509,9 +3833,15 @@ mod tests {
     /// readback of what the apply actually left behind.
     #[tokio::test]
     async fn issue_474_apply_preserves_every_board_only_object() {
-        use crate::router::ToolRouter;
+        run_annotation_apply(false).await;
+    }
+    #[tokio::test]
+    async fn served_apply_reports_uncertain_when_mpn_is_lost_after_write() {
+        run_annotation_apply(true).await;
+    }
+    async fn run_annotation_apply(drop_mpn: bool) {
         use crate::tools::cli::test_support::write_script;
-        use crate::tools::{ServerConfig, ToolContext};
+        use crate::tools::ServerConfig;
         use konnect_ipc::gen::kiapi;
         use prost::Message;
         use std::sync::{Arc, Mutex};
@@ -3565,6 +3895,10 @@ mod tests {
         std::fs::write(
             &exported,
             ONE_RESISTOR
+                .replace(
+                    "(footprint",
+                    "(fields (field (name \"MPN\") \"MFR-42\")) (footprint",
+                )
                 .replace("Resistor_SMD:R_0603_1608Metric", "Resistor_SMD:R_0402")
                 .replace("/Power/VCC", "VCC"),
         )
@@ -3709,7 +4043,21 @@ mod tests {
                                 .is_some_and(|id| id.value == updated_id)
                             })
                             .expect("existing update target");
-                        board_footprints[position] = updated.clone();
+                        let mut observed = updated.clone();
+                        if drop_mpn {
+                            let mut fp = kiapi::board::types::FootprintInstance::decode(
+                                observed.value.as_slice(),
+                            )
+                            .unwrap();
+                            fp.definition.as_mut().unwrap().items.retain(|child| {
+                                !konnect_ipc::builders::any_is(child, "kiapi.board.types.Field")
+                            });
+                            observed = konnect_ipc::builders::pack_any(
+                                &fp,
+                                "kiapi.board.types.FootprintInstance",
+                            );
+                        }
+                        board_footprints[position] = observed;
                         updated_items.push(kiapi::common::commands::ItemUpdateResult {
                             status: Some(ok_item_status()),
                             item: Some(updated),
@@ -3734,34 +4082,30 @@ mod tests {
             },
         );
 
-        let router = Arc::new(ToolRouter::new());
-        router.load("sch_export").await.expect("registered toolset");
-        let tool = router
-            .get_tool("update_pcb_from_schematic")
-            .await
-            .expect("registered sync tool");
-        let context = Arc::new(ToolContext::new(
-            ServerConfig {
-                kicad_cli: cli.to_string_lossy().to_string(),
-                kicad_binary: String::new(),
-                ipc_address: server.address().to_string(),
-                project_dir: None,
-                jlcpcb_db_path: None,
-                auto_load_toolsets: false,
-                eager_toolsets: false,
-            },
-            router,
-        ));
+        let handler = crate::mcp::handler::McpHandler::new(ServerConfig {
+            kicad_cli: cli.to_string_lossy().to_string(),
+            kicad_binary: String::new(),
+            ipc_address: server.address().to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .unwrap();
         let paths = serde_json::json!({
             "schematic": schematic.to_string_lossy(),
             "board": board.to_string_lossy(),
         });
-        let dry_run = (tool.handler)(&paths, context.clone()).await.unwrap();
-        let dry_run: serde_json::Value = serde_json::from_str(&match &dry_run.content[0] {
-            ToolContent::Text { text } => text.clone(),
-            _ => panic!("sync response was not JSON text"),
-        })
-        .unwrap();
+        let dry_request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"update_pcb_from_schematic","arguments":paths}});
+        let dry_result = handler
+            .handle_message(dry_request)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let dry_run: serde_json::Value =
+            serde_json::from_str(dry_result["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(dry_run["status"], "ready", "{dry_run:#}");
         let apply = serde_json::json!({
             "schematic": schematic.to_string_lossy(),
@@ -3769,12 +4113,28 @@ mod tests {
             "dry_run": false,
             "expected_plan_revision": dry_run["plan_revision"],
         });
-        let applied = (tool.handler)(&apply, context).await.unwrap();
-        let applied: serde_json::Value = serde_json::from_str(&match &applied.content[0] {
-            ToolContent::Text { text } => text.clone(),
-            _ => panic!("sync response was not JSON text"),
-        })
-        .unwrap();
+        let request = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"update_pcb_from_schematic","arguments":apply}});
+        let result = handler
+            .handle_message(request.clone())
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(result["isError"], drop_mpn);
+        let applied: serde_json::Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        println!(
+            "MOCK_MCP_SYNC_EVIDENCE {}",
+            serde_json::json!({"source":"mock_kicad_ipc","request":request,"response":result})
+        );
+        if drop_mpn {
+            assert_eq!(applied["status"], "uncertain");
+            assert_eq!(applied["error"]["kind"], "mutation_outcome_uncertain");
+            assert_eq!(applied["coverage"]["fields_synchronized"]["applied"], 0);
+            return;
+        }
+        assert_eq!(applied["coverage"]["fields_synchronized"]["planned"], 1);
+        assert_eq!(applied["coverage"]["fields_synchronized"]["applied"], 1);
         assert_eq!(applied["status"], "applied");
         assert_eq!(applied["coverage"]["conflicts"]["planned"], 0);
         assert_eq!(applied["coverage"]["conflicts"]["applied"], 0);
@@ -3878,6 +4238,7 @@ mod tests {
             footprint_id: footprint_id.to_string(),
             symbol_path: format!("/{reference}-uuid"),
             dnp: false,
+            schematic_fields: SchematicFields::default(),
             pad_nets: pads
                 .iter()
                 .map(|pad| (pad.to_string(), format!("{reference}-{pad}")))
@@ -4372,5 +4733,338 @@ mod tests {
             keys(&refused["diagnostics"][0]),
             keys(&planned["diagnostics"][0])
         );
+    }
+}
+
+#[cfg(test)]
+mod schematic_fields_tests {
+    use super::*;
+    use crate::tools::pcb_board::board_mock::{board_document, spawn_kicad_holding_board};
+    use konnect_ipc::gen::kiapi;
+    const NETLIST: &str = include_str!("../../tests/fixtures/unassigned_footprint.net");
+    #[test]
+    fn exported_custom_fields_are_retained_and_duplicates_refuse() {
+        let source = NETLIST.replace("(fields", "(fields (field (name \"MPN\") \"MFR-42\")");
+        let design = parse_exported_netlist(&source).unwrap();
+        assert!(design.components.iter().all(|c| c
+            .schematic_fields
+            .fields
+            .get("MPN")
+            .map(String::as_str)
+            == Some("MFR-42")));
+        assert!(design
+            .components
+            .iter()
+            .all(|c| !c.schematic_fields.fields.contains_key("Footprint")));
+        let duplicate = source.replace("(fields", "(fields (field (name \"MPN\") \"MFR-OTHER\")");
+        assert!(parse_exported_netlist(&duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate exported field"));
+        let section = NETLIST.replace("(fields", "(fields) (fields");
+        assert!(parse_exported_netlist(&section)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate exported fields sections"));
+    }
+    fn design_for_flags(source: &str) -> ExportedDesign {
+        let tree = konnect_sexp::parse_sexp(source).unwrap();
+        let components = tree
+            .find_all("symbol")
+            .into_iter()
+            .map(|symbol| {
+                let props = symbol.find_all("property");
+                let prop = |name| {
+                    props
+                        .iter()
+                        .find(|p| p.get(1).and_then(SexpNode::as_str) == Some(name))
+                        .unwrap()
+                        .get(2)
+                        .and_then(SexpNode::as_str)
+                        .unwrap()
+                        .to_owned()
+                };
+                DesignComponent {
+                    reference: prop("Reference"),
+                    value: prop("Value"),
+                    footprint_id: "Resistor_SMD:R_0603_1608Metric".to_owned(),
+                    symbol_path: format!("/sheet/{}", symbol.find_str("uuid").unwrap()),
+                    dnp: false,
+                    schematic_fields: SchematicFields::default(),
+                    pad_nets: BTreeMap::new(),
+                }
+            })
+            .collect();
+        ExportedDesign {
+            components,
+            skipped: vec![],
+            unassigned: vec![],
+        }
+    }
+    #[test]
+    fn bom_exclusion_does_not_change_board_inclusion_or_unassigned_reporting() {
+        let captured = include_str!("../../tests/fixtures/structural_scans_kicad10.kicad_sch");
+        for bom in [true, false] {
+            for on_board in [true, false] {
+                let source = captured
+                    .replace(
+                        "(in_bom yes)",
+                        if bom { "(in_bom yes)" } else { "(in_bom no)" },
+                    )
+                    .replace(
+                        "(on_board yes)",
+                        if on_board {
+                            "(on_board yes)"
+                        } else {
+                            "(on_board no)"
+                        },
+                    );
+                let dir = tempfile::tempdir().unwrap();
+                let file = dir.path().join("flags.kicad_sch");
+                std::fs::write(&file, &source).unwrap();
+                let mut design = design_for_flags(&source);
+                let count = design.components.len();
+                assert!(count > 0);
+                let first = design.components[0].clone();
+                design.unassigned.push(UnassignedComponent {
+                    reference: first.reference.clone(),
+                    value: first.value,
+                    lib_id: None,
+                    symbol_path: first.symbol_path,
+                });
+                apply_saved_symbol_flags(&[file], &mut design).unwrap();
+                assert_eq!(
+                    design.components.len(),
+                    if on_board { count } else { 0 },
+                    "bom={bom}, on_board={on_board}"
+                );
+                assert_eq!(design.unassigned.len(), usize::from(on_board));
+                assert!(design
+                    .components
+                    .iter()
+                    .all(|c| c.schematic_fields.exclude_from_bom != bom));
+                if !on_board {
+                    assert!(design.skipped.len() >= count);
+                }
+            }
+        }
+    }
+    fn captured_footprint() -> kiapi::board::types::FootprintInstance {
+        kiapi::board::types::FootprintInstance::decode(
+            include_bytes!("../../tests/fixtures/issue_474_r1.ipc.bin").as_slice(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn field_only_update_is_planned_and_preserves_unrelated_field_presentation() {
+        let mut before = captured_footprint();
+        before.symbol_path = Some(kiapi::common::types::SheetPath {
+            path: vec![kiapi::common::types::Kiid {
+                value: "schematic-symbol".to_owned(),
+            }],
+            path_human_readable: String::new(),
+        });
+        let custom = new_schematic_field(
+            &before.value_field,
+            before.position,
+            "BoardNote",
+            "preserve me",
+        );
+        before
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .push(konnect_ipc::builders::pack_any(
+                &custom,
+                "kiapi.board.types.Field",
+            ));
+        let board = board_footprint_from_instance(&before).unwrap();
+        let fields = SchematicFields {
+            exclude_from_bom: true,
+            fields: BTreeMap::from([("MPN".to_owned(), "MFR-42".to_owned())]),
+        };
+        let component = DesignComponent {
+            reference: board.reference.clone(),
+            value: board.value.clone(),
+            footprint_id: board.footprint_id.clone(),
+            symbol_path: board.symbol_path.clone().unwrap(),
+            dnp: board.dnp,
+            schematic_fields: fields.clone(),
+            pad_nets: board.pad_nets.clone(),
+        };
+        let state = BoardState {
+            footprints: vec![board],
+            routed_nets: BTreeMap::new(),
+            bounds: Bounds {
+                min_x: 0.,
+                min_y: 0.,
+                max_x: 50.,
+                max_y: 40.,
+            },
+        };
+        let design = ExportedDesign {
+            components: vec![component],
+            skipped: vec![],
+            unassigned: vec![],
+        };
+        let plan = plan_sync("netlist", &design, &state);
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.counts.updated.planned, 1);
+        assert_eq!(plan.counts.fields_synchronized.planned, 1);
+        let item = konnect_ipc::builders::pack_any(&before, "kiapi.board.types.FootprintInstance");
+        let updated = update_footprint_item(&item, &plan.changes[0], &BTreeMap::new()).unwrap();
+        let mut after =
+            kiapi::board::types::FootprintInstance::decode(updated.value.as_slice()).unwrap();
+        let annotations = read_schematic_fields(&after).unwrap();
+        assert!(annotations.exclude_from_bom);
+        assert_eq!(annotations.fields["MPN"], "MFR-42");
+        assert_eq!(annotations.fields["BoardNote"], "preserve me");
+        let kept = after
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .find(|item| item.value == custom.encode_to_vec())
+            .unwrap();
+        assert_eq!(kept.value, custom.encode_to_vec());
+        let first_ids = after
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|i| konnect_ipc::builders::any_is(i, "kiapi.board.types.Field"))
+            .map(|i| {
+                kiapi::board::types::Field::decode(i.value.as_slice())
+                    .unwrap()
+                    .text
+                    .unwrap()
+                    .id
+                    .unwrap()
+                    .value
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(first_ids.len(), 2);
+        let stable = after.clone();
+        sync_schematic_fields(&mut after, &fields).unwrap();
+        assert_eq!(after, stable);
+        let mut changed = state.clone();
+        changed.footprints[0]
+            .schematic_fields
+            .fields
+            .insert("MPN".to_owned(), "OTHER".to_owned());
+        assert_ne!(
+            plan_revision("netlist", &state),
+            plan_revision("netlist", &changed)
+        );
+    }
+    #[test]
+    fn independent_field_readback_detects_missing_changed_duplicate_and_wrong_uuid() {
+        let dir = tempfile::tempdir().unwrap();
+        let board = dir.path().join("test.kicad_pcb");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/specctra_two_resistors.kicad_pcb"),
+            &board,
+        )
+        .unwrap();
+        let mut expected = captured_footprint();
+        sync_schematic_fields(
+            &mut expected,
+            &SchematicFields {
+                exclude_from_bom: true,
+                fields: BTreeMap::from([("MPN".to_owned(), "MFR-42".to_owned())]),
+            },
+        )
+        .unwrap();
+        let sent =
+            konnect_ipc::builders::pack_any(&expected, "kiapi.board.types.FootprintInstance");
+        let change = PlannedChange::Update {
+            kiid: expected.id.as_ref().unwrap().value.clone(),
+            reference: field_text(&expected.reference_field),
+            value: field_text(&expected.value_field),
+            symbol_path: "/sheet/symbol".to_owned(),
+            dnp: false,
+            schematic_fields: SchematicFields {
+                exclude_from_bom: true,
+                fields: BTreeMap::from([("MPN".to_owned(), "MFR-42".to_owned())]),
+            },
+            pad_nets: BTreeMap::new(),
+            preserve: PreservedBoardState {
+                position: Point { x: 0., y: 0. },
+                rotation: 0.,
+                layer: "F.Cu".to_owned(),
+                locked: false,
+            },
+        };
+        for fault in [
+            "none",
+            "missing_field",
+            "wrong_value",
+            "duplicate",
+            "wrong_uuid",
+            "bom_flag",
+            "missing_payload",
+        ] {
+            let mut observed = expected.clone();
+            match fault {
+                "missing_field" => observed
+                    .definition
+                    .as_mut()
+                    .unwrap()
+                    .items
+                    .retain(|i| !konnect_ipc::builders::any_is(i, "kiapi.board.types.Field")),
+                "wrong_value" => sync_schematic_fields(
+                    &mut observed,
+                    &SchematicFields {
+                        exclude_from_bom: true,
+                        fields: BTreeMap::from([("MPN".to_owned(), "WRONG".to_owned())]),
+                    },
+                )
+                .unwrap(),
+                "wrong_uuid" => observed.id.as_mut().unwrap().value = "other-uuid".to_owned(),
+                "bom_flag" => {
+                    observed
+                        .attributes
+                        .as_mut()
+                        .unwrap()
+                        .exclude_from_bill_of_materials = false
+                }
+                _ => {}
+            }
+            let mut items = vec![konnect_ipc::builders::pack_any(
+                &observed,
+                "kiapi.board.types.FootprintInstance",
+            )];
+            if fault == "duplicate" {
+                items.extend(items.clone());
+            }
+            let server = spawn_kicad_holding_board(&board, move |command| {
+                if command.type_url.ends_with("GetItems") && fault != "missing_payload" {
+                    Some(konnect_ipc::builders::pack_any(
+                        &kiapi::common::commands::GetItemsResponse {
+                            header: None,
+                            status: kiapi::common::types::ItemRequestStatus::IrsOk as i32,
+                            items: items.clone(),
+                        },
+                        "kiapi.common.commands.GetItemsResponse",
+                    ))
+                } else {
+                    None
+                }
+            });
+            let result = verify_schematic_fields(
+                &konnect_ipc::KiCadIpcClient::new(server.address()),
+                &board_document(&board.to_string_lossy()),
+                std::slice::from_ref(&sent),
+                std::slice::from_ref(&change),
+            );
+            assert_eq!(result.is_ok(), fault == "none", "fault={fault}");
+            if fault == "none" {
+                assert_eq!(result.unwrap(), 1);
+            }
+        }
     }
 }

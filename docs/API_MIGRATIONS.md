@@ -3,6 +3,15 @@
 Konnect's tool schemas are public API. This file records intentional argument
 removals and the supported replacement workflow.
 
+## Unreleased: schematic annotations and BOM flags in PCB sync (minor release)
+
+`update_pcb_from_schematic` synchronizes exported custom fields and BOM exclusion.
+BOM-excluded parts remain eligible for board inclusion. The response adds
+`schematic_fields` in changes and `coverage.fields_synchronized`. Failed writes
+or annotation readback now report an uncertain outcome instead of implying
+rollback. See [the annotation contract](SCHEMATIC_FIELD_SYNC.md) for sources,
+counts, compatibility and recovery.
+
 ## Unreleased: reading the board's physical stackup (minor release)
 
 The `pcb_board` toolset adds `get_board_stackup`. It reads the physical
