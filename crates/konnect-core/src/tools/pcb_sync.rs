@@ -4849,6 +4849,7 @@ mod tests {
                         &footprint.value,
                         footprint.symbol_path.as_deref().unwrap(),
                         footprint.dnp,
+                        &footprint.schematic_fields,
                         &footprint.pad_nets,
                         &BTreeMap::new(),
                     )
@@ -5237,6 +5238,7 @@ mod schematic_fields_tests {
             })
             .collect();
         ExportedDesign {
+            root_uuid: None,
             components,
             skipped: vec![],
             unassigned: vec![],
@@ -5345,6 +5347,7 @@ mod schematic_fields_tests {
             },
         };
         let design = ExportedDesign {
+            root_uuid: None,
             components: vec![component],
             skipped: vec![],
             unassigned: vec![],
