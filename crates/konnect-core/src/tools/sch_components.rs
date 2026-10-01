@@ -2488,13 +2488,28 @@ fn property_insert_edit(
 
     // Match the block's own indentation rather than assuming: eeschema saves
     // with tabs, this crate's writer uses two spaces.
-    let indent = block
-        .find("(property ")
-        .map(|p| {
+    let indent = konnect_sexp::writer::find_direct_child_blocks(block, "symbol")
+        .into_iter()
+        .find(|&(p, _)| block[p..].starts_with("(property "))
+        .and_then(|(p, _)| {
             let line_start = block[..p].rfind('\n').map_or(0, |n| n + 1);
-            block[line_start..p].to_string()
+            let prefix = &block[line_start..p];
+            // A compact symbol has its header on this line. Only actual
+            // whitespace can be indentation; copying the header opens a new
+            // nested symbol on every generated property line.
+            prefix
+                .chars()
+                .all(char::is_whitespace)
+                .then(|| prefix.to_string())
         })
-        .unwrap_or_else(|| "\t\t".to_string());
+        .unwrap_or_else(|| {
+            let line_start = content[..start].rfind('\n').map_or(0, |n| n + 1);
+            let prefix = content[line_start..start]
+                .chars()
+                .take_while(|ch| matches!(ch, ' ' | '\t'))
+                .collect::<String>();
+            format!("{prefix}\t")
+        });
 
     let escaped_name = escape_property_text(name);
     let escaped_value = escape_property_text(value);
