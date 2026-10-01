@@ -18,8 +18,6 @@ struct LibraryFootprint {
     library_id: String,
     definition: kiapi::board::types::Footprint,
     attributes: kiapi::board::types::FootprintAttributes,
-    datasheet: Option<String>,
-    description_field: Option<String>,
     properties: Vec<kiapi::board::types::Field>,
     pads: Vec<konnect_ipc::IpcPadDefinition>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
@@ -31,8 +29,6 @@ struct LibraryFootprint {
 
 #[derive(Debug)]
 struct ParsedLibraryProperties {
-    datasheet: Option<String>,
-    description: Option<String>,
     custom: Vec<kiapi::board::types::Field>,
 }
 
@@ -106,6 +102,7 @@ struct PreservedState {
     symbol_path: bool,
     pad_nets: bool,
     instance_overrides: bool,
+    instance_field_values: bool,
 }
 
 impl PreservedState {
@@ -138,7 +135,9 @@ impl PreservedState {
             pad_nets: old_nets.iter().all(|(number, net)| {
                 new_nets.get(number).map(String::as_str) == Some(net.name.as_str())
             }),
+            // This flag describes design-rule overrides, not text annotations.
             instance_overrides: updated.overrides == current.overrides,
+            instance_field_values: instance_field_values(updated) == instance_field_values(current),
         }
     }
 }
@@ -174,7 +173,8 @@ pub(crate) fn tool() -> ToolDef {
         "Plan or atomically apply KiCad's Update Footprints from Library operation to placed \
          footprints on the live board. Defaults to a non-mutating dry run; apply requires its \
          exact plan revision. Preserves placed-instance state and pad nets while refreshing \
-         supported library-owned content.",
+         supported library-owned content. Existing annotation values (including empty values) \
+         are preserved; missing custom fields are added from the library.",
         json!({
             "type": "object",
             "properties": {
@@ -805,8 +805,6 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         library_id: library_id.to_string(),
         definition,
         attributes,
-        datasheet: properties.datasheet,
-        description_field: properties.description,
         properties: properties.custom,
         pads,
         graphics,
@@ -863,6 +861,26 @@ fn parse_pad_mask_margin(pad: &konnect_sexp::SexpNode) -> Result<Option<i64>> {
     );
     // Preserve explicit zero as Some(0), distinct from an inherited setting.
     Ok(Some((value * 1_000_000.0).round() as i64))
+}
+
+fn instance_field_values(
+    footprint: &kiapi::board::types::FootprintInstance,
+) -> Vec<Option<String>> {
+    [
+        &footprint.reference_field,
+        &footprint.value_field,
+        &footprint.datasheet_field,
+        &footprint.description_field,
+    ]
+    .into_iter()
+    .map(|field| {
+        field
+            .as_ref()
+            .and_then(|f| f.text.as_ref())
+            .and_then(|t| t.text.as_ref())
+            .map(|t| t.text.clone())
+    })
+    .collect()
 }
 
 fn normalized_mandatory_fields(
@@ -952,7 +970,8 @@ fn verify_library_readback(
                 && preserved.kiid
                 && preserved.symbol_path
                 && preserved.pad_nets
-                && preserved.instance_overrides,
+                && preserved.instance_overrides
+                && preserved.instance_field_values,
             "instance state differs after library update of '{id}'"
         );
         count += 1;
@@ -962,8 +981,6 @@ fn verify_library_readback(
 
 fn parse_library_properties(root: &konnect_sexp::SexpNode) -> Result<ParsedLibraryProperties> {
     let mut names = BTreeSet::new();
-    let mut datasheet = None;
-    let mut description = None;
     let mut custom = Vec::new();
     for property in root.find_all("property") {
         let name = property
@@ -975,28 +992,18 @@ fn parse_library_properties(root: &konnect_sexp::SexpNode) -> Result<ParsedLibra
         }
 
         // Mandatory and custom properties share one lossless clause validator.
-        // The mandatory values keep their existing first-class IPC fields; the
+        // Mandatory values remain owned by the placed first-class IPC fields; the
         // shared parser proves that none of their authored clauses would be
         // silently ignored without requiring a typed custom Field.
         let mandatory = matches!(name, "Reference" | "Value" | "Datasheet" | "Description");
         let parsed = parse_library_property(property, !mandatory)?;
-        let value = property
-            .get(2)
-            .and_then(konnect_sexp::SexpNode::as_str)
-            .with_context(|| format!("property '{name}' is missing its value"))?;
         match name {
-            "Reference" | "Value" => {}
-            "Datasheet" => datasheet = Some(value.to_string()),
-            "Description" => description = Some(value.to_string()),
+            "Reference" | "Value" | "Datasheet" | "Description" => {}
             _ => custom.push(parsed.context("custom property did not produce a typed field")?),
         }
     }
 
-    Ok(ParsedLibraryProperties {
-        datasheet,
-        description,
-        custom,
-    })
+    Ok(ParsedLibraryProperties { custom })
 }
 
 /// Convert a footprint property into the typed `Field` shape carried by
@@ -1851,14 +1858,6 @@ fn build_updated_instance(
     definition.value_field = current_definition.value_field.clone();
     definition.datasheet_field = current_definition.datasheet_field.clone();
     definition.description_field = current_definition.description_field.clone();
-    apply_field_value(
-        &mut definition.datasheet_field,
-        library.datasheet.as_deref(),
-    );
-    apply_field_value(
-        &mut definition.description_field,
-        library.description_field.as_deref(),
-    );
     definition.items.extend(
         library.models.iter().map(|model| {
             konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
@@ -1958,11 +1957,6 @@ fn build_updated_instance(
         }
     }
     updated.definition = Some(definition);
-    apply_field_value(&mut updated.datasheet_field, library.datasheet.as_deref());
-    apply_field_value(
-        &mut updated.description_field,
-        library.description_field.as_deref(),
-    );
     let mut attributes = library.attributes.clone();
     if let Some(current_attributes) = current.attributes.as_ref() {
         attributes.not_in_schematic = current_attributes.not_in_schematic;
@@ -1984,19 +1978,6 @@ fn build_updated_instance(
     })
 }
 
-fn apply_field_value(field: &mut Option<kiapi::board::types::Field>, value: Option<&str>) {
-    let Some(value) = value else {
-        return;
-    };
-    field
-        .get_or_insert_with(Default::default)
-        .text
-        .get_or_insert_with(Default::default)
-        .text
-        .get_or_insert_with(Default::default)
-        .text = value.to_string();
-}
-
 fn merge_custom_properties(
     updated: &mut kiapi::board::types::Footprint,
     current: &kiapi::board::types::Footprint,
@@ -2005,10 +1986,6 @@ fn merge_custom_properties(
     footprint_rotation: f64,
     is_back: bool,
 ) -> Result<()> {
-    let library_names = library_properties
-        .iter()
-        .map(|field| field.name.as_str())
-        .collect::<BTreeSet<_>>();
     let mut current_names = BTreeSet::new();
     for item in current
         .items
@@ -2026,13 +2003,14 @@ fn merge_custom_properties(
                 field.name
             );
         }
-        if !library_names.contains(field.name.as_str()) {
-            // A field that exists only on the placed instance belongs to that
-            // instance. Preserve its complete typed representation verbatim.
-            updated.items.push(item.clone());
-        }
+        // Existing annotations belong to the placed design. Without provenance,
+        // a matching library name cannot establish permission to replace them.
+        updated.items.push(item.clone());
     }
     for property in library_properties {
+        if current_names.contains(&property.name) {
+            continue;
+        }
         let property =
             transform_library_property(property, footprint_position, footprint_rotation, is_back)?;
         updated.items.push(konnect_ipc::builders::pack_any(
@@ -2578,7 +2556,6 @@ mod tests {
                     && *stroke_width_mm == 0.15
             )
         }));
-        assert_eq!(library.datasheet.as_deref(), Some("new-datasheet.pdf"));
         assert_eq!(
             library
                 .properties
@@ -2967,7 +2944,7 @@ mod tests {
         assert_eq!(updated.locked, current.locked);
         assert_eq!(updated.reference_field, current.reference_field);
         assert_eq!(updated.value_field, current.value_field);
-        assert_eq!(field_text(&updated.datasheet_field), "new-datasheet.pdf");
+        assert_eq!(field_text(&updated.datasheet_field), "placed-datasheet");
         assert_eq!(
             updated
                 .datasheet_field
@@ -2982,10 +2959,7 @@ mod tests {
                 .and_then(|text| text.text.as_ref())
                 .and_then(|text| text.attributes.as_ref())
         );
-        assert_eq!(
-            field_text(&updated.description_field),
-            "new field description"
-        );
+        assert_eq!(field_text(&updated.description_field), "placed-description");
         let attributes = updated.attributes.as_ref().unwrap();
         let current_attributes = current.attributes.as_ref().unwrap();
         assert_eq!(
@@ -3095,7 +3069,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_preserves_instance_only_properties_and_refreshes_library_properties() {
+    fn merge_preserves_existing_properties_and_adds_missing_library_properties() {
         let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
         let instance_only = field("InstanceNote", "keep this", 105.0, 55.0, false);
         let stale_library_property = field("AssemblyVendor", "old library value", 99.0, 49.0, true);
@@ -3121,7 +3095,7 @@ mod tests {
                 .iter()
                 .map(|property| property.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["InstanceNote", "KiLib_Generator", "AssemblyVendor"]
+            vec!["InstanceNote", "AssemblyVendor", "KiLib_Generator"]
         );
         assert_eq!(
             properties
@@ -3137,7 +3111,7 @@ mod tests {
                     .find(|property| property.name == "AssemblyVendor")
                     .unwrap()
             ),
-            "Example Assembly"
+            "old library value"
         );
         assert!(prepared.changed_domains.contains(&ChangedDomain::Metadata));
     }
@@ -3756,7 +3730,7 @@ mod tests {
     }
 
     #[test]
-    fn datasheet_only_library_change_is_reported_as_metadata() {
+    fn datasheet_only_library_change_does_not_overwrite_instance_annotation() {
         let base = parse_library_footprint("Test:Socket", LIBRARY_FOOTPRINT).unwrap();
         let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
         let net_codes = BTreeMap::from([("ROW1".to_string(), 11), ("COL1".to_string(), 12)]);
@@ -3770,10 +3744,7 @@ mod tests {
 
         let prepared = build_updated_instance(&applied, &changed, &net_codes, &routed).unwrap();
 
-        assert_eq!(
-            prepared.changed_domains,
-            BTreeSet::from([ChangedDomain::Metadata])
-        );
+        assert!(prepared.changed_domains.is_empty());
     }
 
     #[test]
@@ -3951,9 +3922,19 @@ mod tests {
 
     fn spawn_planner_mock_with_fault(
         board: &Path,
+        footprint: prost_types::Any,
+        fail_update: bool,
+        lose_mask: bool,
+    ) -> PlannerMock {
+        spawn_planner_mock_faults(board, footprint, fail_update, lose_mask, false)
+    }
+
+    fn spawn_planner_mock_faults(
+        board: &Path,
         mut footprint: prost_types::Any,
         fail_update: bool,
         lose_mask: bool,
+        lose_annotation: bool,
     ) -> PlannerMock {
         use nng::options::Options;
 
@@ -4061,6 +4042,25 @@ mod tests {
                                     *item = builders::pack_any(&pad, "kiapi.board.types.Pad");
                                 }
                             }
+                            footprint =
+                                builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
+                        }
+                        if lose_annotation {
+                            let mut fp = kiapi::board::types::FootprintInstance::decode(
+                                footprint.value.as_slice(),
+                            )
+                            .unwrap();
+                            fp.datasheet_field
+                                .as_mut()
+                                .unwrap()
+                                .text
+                                .as_mut()
+                                .unwrap()
+                                .text
+                                .as_mut()
+                                .unwrap()
+                                .text
+                                .clear();
                             footprint =
                                 builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
                         }
@@ -4445,6 +4445,113 @@ mod tests {
                 capture.commit_actions,
                 vec![kiapi::common::commands::CommitAction::CmaCommit]
             );
+        }
+    }
+    mod annotation_regressions {
+        use super::*;
+
+        #[test]
+        fn field_preservation_evidence_detects_cleared_and_absent_annotations() {
+            let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+            let mut changed = current.clone();
+            changed.datasheet_field = Some(field("Datasheet", "", 0.0, 0.0, false));
+            assert!(
+                !PreservedState::derive(&current, &changed, &BTreeMap::new()).instance_field_values
+            );
+            changed.datasheet_field = None;
+            assert!(
+                !PreservedState::derive(&current, &changed, &BTreeMap::new()).instance_field_values
+            );
+            assert!(
+                PreservedState::derive(&current, &current, &BTreeMap::new()).instance_field_values
+            );
+        }
+
+        #[tokio::test]
+        async fn cleared_annotation_after_accepted_update_is_reported_uncertain() {
+            let (_tmp, board, items) = plan_fixture();
+            let mock = spawn_planner_mock_faults(&board, items[0].clone(), false, false, true);
+            let ctx = test_context(&mock.url);
+            let dry = handle_update_footprints_from_library(&json!({"board": board}), &ctx)
+                .await
+                .unwrap();
+            let request = json!({"board": board, "dry_run": false, "expected_plan_revision": result_json(&dry)["plan_revision"]});
+            let result = handle_update_footprints_from_library(&request, &ctx)
+                .await
+                .unwrap();
+            assert!(result.is_error);
+            let body = result_json(&result);
+            assert_eq!(body["status"], "uncertain");
+            assert_eq!(body["error"]["kind"], "mutation_outcome_uncertain");
+            assert_eq!(body["coverage"]["changed"]["applied"], 0);
+            assert_eq!(mock.capture.lock().unwrap().update_batches, vec![1]);
+            println!(
+                "REGRESSION_MCP_FIELDS_EVIDENCE {}",
+                json!({"request":request,"response":body,"source":"independent_fault_injected_ipc_readback"})
+            );
+        }
+
+        #[test]
+        fn instance_annotations_survive_empty_and_nonempty_library_defaults() {
+            for layer in [
+                kiapi::board::types::BoardLayer::BlFCu,
+                kiapi::board::types::BoardLayer::BlBCu,
+            ] {
+                for source in [
+                    KICAD_LIBRARY_FOOTPRINT.to_owned(),
+                    KICAD_LIBRARY_FOOTPRINT.replace("new-datasheet.pdf", ""),
+                ] {
+                    let mut current = current_instance(layer);
+                    let note = field("AssemblyVendor", "instance override", 7.0, 9.0, true);
+                    current
+                        .definition
+                        .as_mut()
+                        .unwrap()
+                        .items
+                        .push(builders::pack_any(&note, "kiapi.board.types.Field"));
+                    let library = parse_library_footprint("Test:Socket", &source).unwrap();
+                    let prepared = build_updated_instance(
+                        &current,
+                        &library,
+                        &BTreeMap::new(),
+                        &BTreeSet::new(),
+                    )
+                    .unwrap();
+                    let after = kiapi::board::types::FootprintInstance::decode(
+                        prepared.item.value.as_slice(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        field_text(&after.datasheet_field),
+                        "placed-datasheet",
+                        "library refresh must preserve schematic Datasheet"
+                    );
+                    assert_eq!(field_text(&after.description_field), "placed-description");
+                    assert_eq!(after.reference_field, current.reference_field);
+                    assert_eq!(after.value_field, current.value_field);
+                    assert_eq!(
+                        decoded_custom_fields(&after)
+                            .iter()
+                            .find(|f| f.name == "AssemblyVendor")
+                            .unwrap(),
+                        &note
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn explicit_empty_instance_annotation_is_not_replaced_by_library_default() {
+            let mut current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+            current.datasheet_field = Some(field("Datasheet", "", 5.0, 6.0, false));
+            let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+            let prepared =
+                build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new())
+                    .unwrap();
+            let after =
+                kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
+                    .unwrap();
+            assert_eq!(after.datasheet_field, current.datasheet_field);
         }
     }
 }
