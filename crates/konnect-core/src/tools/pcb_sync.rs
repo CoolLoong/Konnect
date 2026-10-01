@@ -2728,10 +2728,31 @@ mod tests {
                     let mut footprint = board_resistor(&component.reference, Some(path));
                     footprint.value = component.value.clone();
                     footprint.pad_nets = component.pad_nets.clone();
+                    footprint.schematic_fields = component.schematic_fields.clone();
                     footprint
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    fn rooted_identity_annotation_update_keeps_the_existing_footprint() {
+        let mut design = identity_design();
+        let board = identity_board(&design, true);
+        let target = design.components[0].reference.clone();
+        design.components[0]
+            .schematic_fields
+            .fields
+            .insert("MPN".to_owned(), "MFR-42".to_owned());
+        let plan = plan_sync(IDENTITY_NETLIST, &design, &board);
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.counts.added.planned, 0);
+        assert_eq!(plan.counts.updated.planned, 1);
+        assert!(
+            matches!(&plan.changes[0],PlannedChange::Update{kiid,reference,symbol_path,schematic_fields,..}
+            if kiid==&board.footprints[0].kiid && reference==&target && Some(symbol_path)==board.footprints[0].symbol_path.as_ref()
+                && schematic_fields.fields.get("MPN").map(String::as_str)==Some("MFR-42"))
+        );
     }
 
     #[test]
