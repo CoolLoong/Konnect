@@ -15,6 +15,10 @@ matched by logical number. Repeated or malformed clauses refuse before writing.
 Other unmodeled clauses still refuse; this does not broaden the tool to arbitrary
 footprint attributes or custom pad geometry.
 
+For schematic-linked footprints, placed BOM exclusion is retained so a library
+refresh cannot undo schematic synchronization. Board-only footprints still take
+the library BOM flag. This changes the previous library-overwrite behavior.
+
 Arguments, filters and default dry run remain unchanged. Apply requires a current
 `expected_plan_revision`, uses one IPC undo commit, and never saves automatically.
 A fresh GetItems readback checks library domains, mandatory field presentation,

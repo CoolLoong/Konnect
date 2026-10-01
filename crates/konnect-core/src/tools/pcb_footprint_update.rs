@@ -1966,6 +1966,11 @@ fn build_updated_instance(
     let mut attributes = library.attributes.clone();
     if let Some(current_attributes) = current.attributes.as_ref() {
         attributes.not_in_schematic = current_attributes.not_in_schematic;
+        // Schematic-linked BOM inclusion belongs to the placed design, not its library.
+        if !current_attributes.not_in_schematic {
+            attributes.exclude_from_bill_of_materials =
+                current_attributes.exclude_from_bill_of_materials;
+        }
         attributes.do_not_populate = current_attributes.do_not_populate;
     }
     updated.attributes = Some(attributes);
@@ -2979,7 +2984,10 @@ mod tests {
             current_attributes.do_not_populate
         );
         assert!(attributes.exclude_from_position_files);
-        assert!(!attributes.exclude_from_bill_of_materials);
+        assert_eq!(
+            attributes.exclude_from_bill_of_materials,
+            current_attributes.exclude_from_bill_of_materials
+        );
         assert_eq!(
             attributes.mounting_style,
             kiapi::board::types::FootprintMountingStyle::FmsSmd as i32
