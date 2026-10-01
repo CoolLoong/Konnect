@@ -3592,10 +3592,10 @@ mod tests {
         );
         let mut component = resistor("R1", "/sheet/existing");
         component.pad_nets.insert("3".into(), "NEW_SIGNAL".into());
-        let design = |component| ExportedDesign {
-            components: vec![component],
-            skipped: vec![],
-            unassigned: vec![],
+        let design = |component| {
+            let mut design = parse_exported_netlist(ONE_RESISTOR).unwrap();
+            design.components = vec![component];
+            design
         };
         let permitted = plan_sync("netlist", &design(component.clone()), &board);
         assert_eq!(permitted.status, PlanStatus::Ready);
