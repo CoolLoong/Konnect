@@ -8,6 +8,7 @@
     "delete_via",
     "move_via",
     "repair_schematic_property_prefixes",
+    "relink_pcb_footprint_to_schematic",
     "set_custom_design_rule"
   ],
   "legacy_entry_ceiling": 3,

@@ -18,6 +18,9 @@ use prost::Message;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+mod identity_relink;
+pub(crate) use identity_relink::tool as identity_relink_tool;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ExportedDesign {
     root_uuid: Option<String>,
