@@ -18,6 +18,7 @@ pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
     "add_schematic_component",
     "annotate_schematic",
     "batch_place_components",
+    "batch_flip_components",
     "delete_via",
     "edit_footprint_field_layout",
     "move_via",

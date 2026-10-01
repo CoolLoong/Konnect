@@ -1045,6 +1045,7 @@ fn entry_indent(content: &str, open_pos: usize) -> Option<String> {
 pub fn tools() -> Vec<ToolDef> {
     vec![
         super::pcb_field_layout::tool(),
+        super::pcb_native_flip::tool(),
         tool!(
             "set_board_size",
             "Add a rectangular board outline of the given dimensions on the Edge.Cuts layer. \
