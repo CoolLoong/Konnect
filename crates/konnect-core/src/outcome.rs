@@ -25,6 +25,7 @@ pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
     "repair_schematic_property_prefixes",
     "relink_pcb_footprint_to_schematic",
     "run_design_review",
+    "set_stackup",
     "set_custom_design_rule",
 ];
 

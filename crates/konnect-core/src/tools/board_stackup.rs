@@ -1,11 +1,10 @@
 //! The board's physical stackup, read from the board KiCad holds open (#716).
 //!
-//! Read-only by design. KiCad 10 declares `UpdateBoardStackup` but does not
-//! implement it, and #716 settled that Konnect will not write a stackup into a
-//! board file meanwhile: the answer names KiCad's Board Setup as the place to
-//! change one. There is no saved-file fallback either — reading the file's
-//! `(stackup …)` block would be a second parser of KiCad's format — so a board
-//! KiCad does not hold open is refused.
+//! This getter remains live-only. KiCad 10 does not implement the native
+//! UpdateBoardStackup command. For reviewed saved-file changes after explicitly
+//! saving and closing the exact PCB, use the separate set_stackup tool; it
+//! validates the candidate and written file by reopening them through KiCad CLI.
+//! Live edits still belong in KiCad's Board Setup.
 
 use crate::mcp::error::ToolErrorKind;
 use crate::mcp::protocol::CallToolResult;
@@ -29,9 +28,9 @@ const THICKNESS_TOLERANCE_MM: f64 = 0.001;
 /// εr and loss tangent are compared to within this.
 const PROPERTY_TOLERANCE: f64 = 1e-6;
 
-const BOARD_SETUP_HINT: &str = "Konnect cannot change a stackup: KiCad 10 declares \
-     UpdateBoardStackup but does not implement it (#716). Change it in KiCad's Board Setup, \
-     under Board Stackup, then read it again.";
+const BOARD_SETUP_HINT: &str = "KiCad 10 does not implement native UpdateBoardStackup (#716). \
+     Change a live stackup in Board Setup. Alternatively save and close this exact PCB, \
+     then use set_stackup with a reviewed preview/revision and CLI readback; reopen afterward.";
 
 /// KiCad's own default finish is "None" (`BOARD_STACKUP::BOARD_STACKUP`), and
 /// "None" is also a finish its list offers, so the answer cannot tell a board
@@ -49,7 +48,7 @@ pub(crate) fn tool() -> ToolDef {
          control, edge settings, and the board thickness KiCad computes from the stack. \
          'findings' lists unspecified fabrication values and, given 'expected', every value \
          that differs from it. Live only, with no file fallback; read-only, so changes are \
-         made in Board Setup.",
+         made in Board Setup or with set_stackup after explicitly saving and closing the PCB.",
         json!({
             "type": "object",
             "properties": {
