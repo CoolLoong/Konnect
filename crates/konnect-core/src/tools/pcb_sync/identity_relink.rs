@@ -33,7 +33,7 @@ pub(crate) fn tool() -> ToolDef {
             "dry_run":{"type":"boolean","default":true},
             "expected_plan_revision":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"Required for apply: revision from this exact mapping's current dry_run"}
         },"required":["schematic","board","reference","footprint_uuid","old_symbol_path","new_symbol_path"]}),
-        |args, ctx| async move { handle(args, ctx).await }
+        |args, ctx| async move { handle_identity_relink(args, ctx).await }
     ).with_board_access(crate::tools::BoardAccess::LiveOnly)
 }
 
@@ -408,7 +408,10 @@ fn refused(target: &str, reason: impl std::fmt::Display) -> CallToolResult {
     )
 }
 
-pub(super) async fn handle(args: &Value, ctx: &ToolContext) -> Result<CallToolResult> {
+pub(super) async fn handle_identity_relink(
+    args: &Value,
+    ctx: &ToolContext,
+) -> Result<CallToolResult> {
     let target = args["board"].as_str().unwrap_or("unresolved board");
     let m = match mapping(args) {
         Ok(m) => m,
@@ -863,19 +866,19 @@ mod tests {
             })
             .unwrap()
         };
-        let dry = decode(handle(&args, &ctx).await.unwrap());
+        let dry = decode(handle_identity_relink(&args, &ctx).await.unwrap());
         assert_eq!(dry["status"], "ready");
         assert_eq!(dry["physical_pads_verified"], 14);
         let mut stale = args.clone();
         stale["dry_run"] = json!(false);
         stale["expected_plan_revision"] = json!("0".repeat(64));
-        let refused = handle(&stale, &ctx).await.unwrap();
+        let refused = handle_identity_relink(&stale, &ctx).await.unwrap();
         assert!(refused.is_error);
         assert_eq!(raw_board(&client, &board).unwrap(), before);
         let mut apply = args.clone();
         apply["dry_run"] = json!(false);
         apply["expected_plan_revision"] = dry["plan_revision"].clone();
-        let applied = decode(handle(&apply, &ctx).await.unwrap());
+        let applied = decode(handle_identity_relink(&apply, &ctx).await.unwrap());
         assert_eq!(applied["status"], "applied");
         assert_eq!(applied["identities_relinked"]["applied"], 1);
         let after = raw_board(&client, &board).unwrap();
@@ -897,7 +900,7 @@ mod tests {
         }
         expected.items = sorted_items(expected.items);
         assert_eq!(after, expected);
-        let repeated = handle(&apply, &ctx).await.unwrap();
+        let repeated = handle_identity_relink(&apply, &ctx).await.unwrap();
         assert!(repeated.is_error);
         assert_eq!(raw_board(&client, &board).unwrap(), after);
         if let Ok(output) = std::env::var("KONNECT_LIVE_IDENTITY_EVIDENCE") {

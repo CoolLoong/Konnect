@@ -17,19 +17,50 @@ fn tools_dir() -> PathBuf {
 }
 
 fn tool_sources() -> Vec<(PathBuf, String)> {
-    let mut sources = std::fs::read_dir(tools_dir())
-        .expect("read tools source directory")
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
-        .map(|path| {
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-            (path, source)
-        })
-        .collect::<Vec<_>>();
+    tool_sources_under(&tools_dir())
+}
+
+fn tool_sources_under(root: &Path) -> Vec<(PathBuf, String)> {
+    let mut sources = Vec::new();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
+        {
+            let entry = entry.expect("read tools source entry");
+            let path = entry.path();
+            let kind = entry.file_type().expect("read tools source entry type");
+            if kind.is_dir() {
+                directories.push(path);
+            } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                sources.push((path, source));
+            }
+        }
+    }
     sources.sort_by(|a, b| a.0.cmp(&b.0));
     sources
+}
+
+#[test]
+fn nested_tool_modules_are_indexed_with_their_handlers() {
+    let directory = tempfile::tempdir().unwrap();
+    let nested = directory.path().join("pcb_sync/identity");
+    std::fs::create_dir_all(&nested).unwrap();
+    let path = nested.join("relink.rs");
+    std::fs::write(
+        &path,
+        r#"fn tool() { tool!("nested_tool", |args, ctx| async move { handle_nested(args, ctx).await }); }
+        async fn handle_nested(args: &Value, ctx: &ToolContext) { let _ = args["board"]; }"#,
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("ignore.txt"), "not Rust").unwrap();
+    let sources = tool_sources_under(directory.path());
+    assert_eq!(sources.len(), 1);
+    let handlers = registered_handlers(&sources);
+    assert_eq!(handlers["nested_tool"], (path, "handle_nested".into()));
+    assert!(all_function_bodies(&sources).contains_key("handle_nested"));
 }
 
 /// Locate the handler named in a tool's registration. Registrations all call a
