@@ -8,6 +8,7 @@ mod board_stackup;
 pub mod cli;
 pub mod config;
 pub(crate) mod cross_probe;
+mod custom_design_rules;
 pub mod design_review;
 pub(crate) mod drc;
 pub mod editor_navigation;

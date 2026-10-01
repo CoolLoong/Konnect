@@ -21,6 +21,7 @@ pub const ADOPTED_OUTCOME_TOOLS: &[&str] = &[
     "delete_via",
     "move_via",
     "run_design_review",
+    "set_custom_design_rule",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
