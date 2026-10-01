@@ -5435,7 +5435,8 @@ mod schematic_fields_tests {
         sync_schematic_fields(&mut before, &wanted).unwrap();
         let source = include_str!("../../tests/fixtures/c_0603_1608metric_kicad10.kicad_mod");
         let after =
-            super::pcb_footprint_update::refresh_for_integration_test(&before, source).unwrap();
+            crate::tools::pcb_footprint_update::refresh_for_integration_test(&before, source)
+                .unwrap();
         let observed = read_schematic_fields(&after).unwrap();
         assert!(observed.exclude_from_bom);
         assert_eq!(observed.fields["MPN"], "MFR-42");
