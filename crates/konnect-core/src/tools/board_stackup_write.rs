@@ -635,13 +635,13 @@ async fn handle_set_stackup(args: &Value, ctx: &ToolContext) -> Result<CallToolR
     if let Err(e) = closed(ctx, &board).await {
         return Ok(refused(target, e));
     }
+    let source_hash = Sha256::digest(source.as_bytes());
     let preimage = board.with_file_name(format!(
-        "{}.stackup-{}.preimage",
+        "{}.stackup-{source_hash:x}.preimage",
         board
             .file_name()
             .context("filename missing")?
-            .to_string_lossy(),
-        format!("{:x}", Sha256::digest(source.as_bytes()))
+            .to_string_lossy()
     ));
     match std::fs::OpenOptions::new()
         .write(true)
