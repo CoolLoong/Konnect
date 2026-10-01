@@ -1975,7 +1975,7 @@ fn build_updated_instance(
                 for outer in [&mut stack.front_outer_layers, &mut stack.back_outer_layers] {
                     outer
                         .get_or_insert_with(Default::default)
-                        .solder_paste_settings = Some(paste.clone());
+                        .solder_paste_settings = Some(*paste);
                 }
             }
             pad_index += 1;
